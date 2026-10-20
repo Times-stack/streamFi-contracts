@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, Address, Env};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, Symbol};
 
 /// Emergency-pause observability events.
 ///
@@ -110,5 +110,13 @@ pub fn stream_created(
             recipient.clone(),
         ),
         payload,
+    );
+}
+
+/// Emitted when the hash used for future stream deployments changes.
+pub fn stream_contract_upgraded(env: &Env, old_wasm_hash: &BytesN<32>, new_wasm_hash: &BytesN<32>) {
+    env.events().publish(
+        (Symbol::new(env, "StreamContractUpgraded"),),
+        (old_wasm_hash.clone(), new_wasm_hash.clone()),
     );
 }

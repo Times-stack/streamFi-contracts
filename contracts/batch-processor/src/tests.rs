@@ -170,9 +170,51 @@ fn max_batch_size_reports_the_enforced_cap() {
 #[test]
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
-    // v2: SEP-41 token probe before auth, instance-TTL keep-alive, and
-    // `preview_batch` added. Bumped whenever observable behaviour changes.
-    assert_eq!(s.client.version(), 2);
+    // v3 adds a caller-bounded partial batch entry point.
+    assert_eq!(s.client.version(), 3);
+}
+
+#[test]
+fn process_batch_with_limit_reports_and_transfers_only_the_prefix() {
+    let s = Setup::new();
+    let recipients = s.recipients(3);
+    let amounts = s.amounts(&[100, 200, 300]);
+
+    let result =
+        s.client
+            .process_batch_with_limit(&s.funder, &s.token_addr, &recipients, &amounts, &2);
+
+    assert_eq!(result.requested_count, 3);
+    assert_eq!(result.processed_count, 2);
+    assert_eq!(result.remaining_count, 1);
+    assert_eq!(result.transferred_total, 300);
+    assert_eq!(result.results.len(), 2);
+    assert_eq!(s.token.balance(&recipients.get(0).unwrap()), 100);
+    assert_eq!(s.token.balance(&recipients.get(1).unwrap()), 200);
+    assert_eq!(s.token.balance(&recipients.get(2).unwrap()), 0);
+}
+
+#[test]
+fn process_batch_with_limit_rejects_invalid_caps() {
+    let s = Setup::new();
+    let recipients = s.recipients(1);
+    let amounts = s.amounts(&[1]);
+
+    assert_eq!(
+        s.client
+            .try_process_batch_with_limit(&s.funder, &s.token_addr, &recipients, &amounts, &0,),
+        Err(Ok(Error::InvalidBatchLimit)),
+    );
+    assert_eq!(
+        s.client.try_process_batch_with_limit(
+            &s.funder,
+            &s.token_addr,
+            &recipients,
+            &amounts,
+            &(MAX_BATCH_SIZE + 1),
+        ),
+        Err(Ok(Error::InvalidBatchLimit)),
+    );
 }
 
 // ── Validation order (issue #562) ──────────────────────────────────────────

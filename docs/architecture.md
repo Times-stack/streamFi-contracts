@@ -70,14 +70,16 @@ have deliberately narrower responsibilities:
 
 - **BatchTransferProcessor** provides a bounded, guarded execution boundary
   for batch transfer work. It owns batch limits, checked aggregation, state
-  versioning, and stale-callback invalidation; it does not own stream registry
-  or deployment state. See [ADR-007](./adr/007-batch-transfer-processor-scope.md).
+  versioning, and stale-callback invalidation; callers can select a smaller
+  deterministic item cap when processing partial batches. It does not own
+  stream registry or deployment state. See [ADR-007](./adr/007-batch-transfer-processor-scope.md).
 - **TwapOracle** supplies aggregated, staleness-aware price observations for
   integrations that need oracle data. It is independent of stream settlement
   and does not hold stream funds.
-- **TokenVault** is the token custody boundary for integrations that need
-  pooled or separately managed token balances. It sits beside the factory and
-  stream contracts rather than changing the per-stream escrow model.
+- **TokenVault** is an independent custody contract for pooled or separately
+  managed token balances. Its bounded `vault_batch_withdraw` call can also
+  coordinate recipient-authorized withdrawals from multiple streams without
+  changing the per-stream escrow model.
 - **Indexer** consumes factory and stream events and read APIs to build a
   searchable off-chain view of streams, transfers, and protocol activity. It
   is not part of transaction authorization or settlement.

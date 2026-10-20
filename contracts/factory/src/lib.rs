@@ -951,11 +951,19 @@ impl DripFactory {
         // from the governor, so the halt remains comprehensive.
         pause::require_not_paused(&env)?;
 
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamWasmHash)
+            .ok_or(Error::NotInitialized)?;
         ttl::bump_instance(&env);
         ttl::bump_persistent_bucket(&env);
-        env.storage()
-            .instance()
-            .set(&DataKey::StreamWasmHash, &new_wasm_hash);
+        if old_wasm_hash != new_wasm_hash {
+            env.storage()
+                .instance()
+                .set(&DataKey::StreamWasmHash, &new_wasm_hash);
+            events::stream_contract_upgraded(&env, &old_wasm_hash, &new_wasm_hash);
+        }
         Ok(())
     }
 

@@ -43,4 +43,8 @@ pub enum Error {
     ReentrancyDetected = 20,
     /// A single deposit exceeded `MAX_VAULT_DEPOSIT`.
     DepositExceedsMax = 21,
+    /// A stream withdrawal batch is empty, duplicated, or exceeds its cap.
+    InvalidStreamBatch = 22,
+    /// A stream query or withdrawal failed during batch processing.
+    StreamCallFailed = 23,
 }

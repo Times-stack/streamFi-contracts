@@ -40,4 +40,14 @@ pub enum Error {
     StreamDurationTooShort = 26,
     /// The optional human-readable description exceeds 128 bytes.
     DescriptionTooLong = 27,
+    /// The keeper reward token must be valid and distinct from the stream token.
+    InvalidKeeperRewardToken = 28,
+    /// No keeper reward pool has been configured for this stream.
+    KeeperRewardPoolNotConfigured = 29,
+    /// The keeper reward pool cannot cover the configured bounty.
+    InsufficientKeeperRewardPool = 30,
+    /// Keeper reimbursement is not yet due for this stream.
+    KeeperPingTooFrequent = 31,
+    /// Keeper reward transfer did not move the expected balance.
+    KeeperRewardTransferFailed = 32,
 }
