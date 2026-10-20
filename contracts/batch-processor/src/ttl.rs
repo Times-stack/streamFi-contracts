@@ -10,3 +10,4 @@
 /// would eventually be archived (the exposure `docs/security.md` Known
 /// Limitation #1 tracks), and every later batch would need a restore first.
 pub use drip_common::ttl::bump_instance as bump;
+pub use drip_common::ttl::bump_instance;

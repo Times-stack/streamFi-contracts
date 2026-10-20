@@ -7,7 +7,7 @@ mod tests;
 
 use drip_common::is_zero_address;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
     Symbol, Vec,
 };
 
@@ -94,6 +94,13 @@ pub struct BatchResult {
     pub item_index: u32,
     pub success: bool,
     pub error_code: Option<u32>,
+}
+
+impl Error {
+    /// Alias for BatchTooLarge per issue #677.
+    #[allow(non_upper_case_globals)]
+    pub const BatchSizeExceeded: Error = Error::BatchTooLarge;
+    pub const BATCH_SIZE_EXCEEDED: Error = Error::BatchTooLarge;
 }
 
 #[contract]
