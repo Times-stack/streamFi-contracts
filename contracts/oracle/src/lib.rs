@@ -2,7 +2,8 @@
 
 use drip_common::{pause, rbac, ttl};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 /// Maximum number of distinct price feeders the oracle will track. Caps the
@@ -15,7 +16,15 @@ use soroban_sdk::{
 /// bounded to keep aggregation within the transaction budget. 32 feeders is
 /// ample for a TWAP median and keeps `get_twap_price` well under budget
 /// (32 gets + insertion sort).
+/// Standard precision scale for pair price calculations (8 decimals).
+pub const PRICE_PRECISION: u128 = 100_000_000;
+
 const MAX_SUBMITTERS: u32 = 32;
+
+/// Maximum number of reporters retained for any one pair feed.
+const MAX_PAIR_REPORTERS: u32 = 5;
+/// Pair reports older than 15 minutes never participate in the median.
+const PAIR_REPORT_FRESHNESS_SECS: u64 = 15 * 60;
 
 /// Extends the instance storage TTL so the oracle's entries
 /// (`DataKey::Admin`, `DataKey::Config`, `DataKey::Price`, etc.) never silently
@@ -69,6 +78,7 @@ pub struct RoleKey {
 pub enum DataKey {
     Admin,
     Config,
+    QuoteCurrency,
     Price,
     Role(RoleKey),
     AdminCount,
@@ -93,6 +103,50 @@ pub enum DataKey {
     /// `DripGovernor::DataKey::RoleMembers`, closing the gap noted in the
     /// off-chain tooling audit.
     RoleMembers(Role),
+    /// Legacy/latest direct pair price by token Address (base, quote).
+    /// New reads aggregate timestamped per-reporter submissions, but this
+    /// scalar remains as an upgrade fallback for pre-aggregation deployments.
+    PairPrice(Address, Address),
+    /// Timestamped pair report keyed by (base, quote, reporter).
+    PairSubmission(Address, Address, Address),
+    /// Bounded reporter index for one Address pair.
+    PairReporters(Address, Address),
+    /// Legacy/latest direct pair price by Symbol (base, quote).
+    PairPriceSymbol(Symbol, Symbol),
+    /// Timestamped symbol-pair report keyed by (base, quote, reporter).
+    PairSymbolSubmission(Symbol, Symbol, Address),
+    /// Bounded reporter index for one Symbol pair.
+    PairSymbolReporters(Symbol, Symbol),
+    /// Configurable maximum staleness in seconds.
+    MaxStalenessSeconds,
+    /// Configurable maximum price deviation in basis points (Issue #680).
+    MaxDeviationBps,
+    /// Primary oracle data provider / feed address.
+    PrimaryOracle,
+    /// Secondary fallback oracle data provider / feed address used if primary fails.
+    FallbackOracle,
+    /// Staleness check threshold for Stellar native asset price feeds (Issue #776).
+    /// Specifies the maximum age in seconds for Stellar asset prices before they are
+    /// considered stale and rejected. Allows independent configuration from generic
+    /// asset pair feeds when sourcing prices from Stellar's native market data.
+    StellarAssetStalenessSecs,
+    /// **Persistent storage.** Per-token heartbeat configuration keyed by the
+    /// token address (Issue #850). Tokens with different update cadences —
+    /// stablecoins versus volatile assets — can set independent staleness
+    /// tolerances instead of sharing the single global `max_staleness`.
+    AssetOracleConfig(Address),
+}
+
+/// Per-token oracle configuration.
+///
+/// Stablecoins update less frequently than volatile assets, so the heartbeat
+/// tolerance that decides whether a report is fresh is configured per token
+/// rather than globally (Issue #850).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetOracleConfig {
+    /// Maximum age in seconds of a pair report before it is considered stale.
+    pub heartbeat_timeout_seconds: u64,
 }
 
 /// Configuration parameters for the TWAP oracle.
@@ -149,10 +203,32 @@ pub struct OracleConfig {
     pub min_submitters: u32,
 }
 
+/// Optional field-wise changes to oracle configuration. `None` preserves the
+/// currently stored value, avoiding a client-side read-modify-write race.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleConfigUpdate {
+    pub decimals: Option<u32>,
+    pub asset_peg: Option<u32>,
+    pub max_staleness: Option<u64>,
+    pub max_price: Option<u64>,
+    pub min_submit_interval: Option<u64>,
+    pub min_submitters: Option<u32>,
+    pub quote_currency: Option<soroban_sdk::Symbol>,
+    pub max_deviation_bps: Option<u32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceData {
     pub price: u64,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairPriceData {
+    pub price: u128,
     pub updated_at: u64,
 }
 
@@ -241,6 +317,21 @@ pub enum Error {
     InsufficientQuorum = 1020,
     /// The WASM hash provided to `upgrade` is all zeros (invalid).
     InvalidWasmHash = 1021,
+    /// Price feed not found for requested pair.
+    PriceNotFound = 1022,
+    /// A pair already has the maximum five active reporters.
+    TooManyPairReporters = 1023,
+    /// Last price update exceeds the allowed staleness threshold.
+    StalePriceFeed = 1024,
+    /// Price update deviates too rapidly from the previous price, exceeding max_deviation_bps (Issue #680).
+    ExcessivePriceDeviation = 1025,
+    /// Price deviation exceeded (Issue #680).
+    PriceDeviationExceeded = 1026,
+    /// Both primary and fallback oracle feeds failed to return a valid price.
+    FallbackOracleFailed = 1027,
+    /// A per-asset heartbeat timeout of zero was configured. A zero timeout
+    /// would make every report stale immediately (Issue #850).
+    InvalidHeartbeatTimeout = 1028,
 }
 
 #[contract]
@@ -283,6 +374,17 @@ impl TwapOracle {
         role_members(&env, role)
     }
 
+    /// Returns addresses with tracked price submissions, including stale
+    /// submissions. This is the exact roster targeted by `purge_submitter`;
+    /// `role_members(Role::PriceFeeder)` instead lists authorized feeders,
+    /// including those who have never submitted a price.
+    pub fn submitters(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Submitters)
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Grants `role` to `account`. Only an `Admin` may call this.
     pub fn grant_role(
         env: Env,
@@ -319,7 +421,9 @@ impl TwapOracle {
     }
 
     /// Explicitly purges a feeder's submission data and removes them from the
-    /// submitters set. Only an `Admin` may call this.
+    /// submitters set. Use `submitters()` to enumerate the tracked roster;
+    /// `role_members(Role::PriceFeeder)` lists authorized feeders instead.
+    /// Only an `Admin` may call this.
     pub fn purge_submitter(env: Env, caller: Address, feeder: Address) -> Result<(), Error> {
         require_role_or_admin(&env, &caller, Role::Admin)?;
         bump_instance(&env);
@@ -346,7 +450,7 @@ impl TwapOracle {
 
     // ── Reads ────────────────────────────────────────────────────────────
 
-    /// Reconfigures oracle parameters and pricing settings. Admin-gated.
+    /// Replaces all oracle parameters and pricing settings. Admin-gated.
     ///
     /// # Authorization
     ///
@@ -397,52 +501,71 @@ impl TwapOracle {
     ///   exceeds [`MAX_SUBMITTERS`].
     pub fn configure_oracle(env: Env, caller: Address, config: OracleConfig) -> Result<(), Error> {
         require_role_or_admin(&env, &caller, Role::Admin)?;
+        store_oracle_config(&env, &caller, config)
+    }
 
-        if config.decimals > 19 {
-            return Err(Error::InvalidDecimals);
+    /// Returns the complete stored oracle configuration.
+    pub fn oracle_config(env: Env) -> Result<OracleConfig, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::OracleNotConfigured)
+    }
+
+    /// Applies only the supplied fields; all omitted fields retain their
+    /// current values. Configuration validation and price-cache invalidation
+    /// are identical to `configure_oracle`.
+    pub fn update_oracle_config(
+        env: Env,
+        caller: Address,
+        update: OracleConfigUpdate,
+    ) -> Result<(), Error> {
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        let mut config: OracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::OracleNotConfigured)?;
+
+        if let Some(value) = update.decimals {
+            config.decimals = value;
+        }
+        if let Some(value) = update.asset_peg {
+            config.asset_peg = value;
+        }
+        if let Some(value) = update.max_staleness {
+            config.max_staleness = value;
+        }
+        if let Some(value) = update.max_price {
+            config.max_price = value;
+        }
+        if let Some(value) = update.min_submit_interval {
+            config.min_submit_interval = value;
+        }
+        if let Some(value) = update.min_submitters {
+            config.min_submitters = value;
         }
 
-        if config.max_staleness == 0 {
-            return Err(Error::InvalidMaxStaleness);
+        let quote_currency = update.quote_currency;
+        store_oracle_config(&env, &caller, config)?;
+        if let Some(currency) = quote_currency {
+            env.storage()
+                .instance()
+                .set(&DataKey::QuoteCurrency, &currency);
+            events::quote_currency_configured(&env, &caller, currency);
         }
-
-        // The quorum must be at least one (a zero-feeder quorum would let the
-        // oracle report prices nobody backs) and can never exceed the capped
-        // submitter set aggregation iterates over (issue #661).
-        if config.min_submitters == 0 || config.min_submitters > MAX_SUBMITTERS {
-            return Err(Error::InvalidMinSubmitters);
+        if let Some(dev) = update.max_deviation_bps {
+            env.storage()
+                .instance()
+                .set(&DataKey::MaxDeviationBps, &dev);
         }
-
-        bump_instance(&env);
-
-        // Check if decimals or asset_peg changed relative to existing config.
-        // If so, clear all stored price data to prevent magnitude misinterpretation.
-        let existing: Option<OracleConfig> = env.storage().instance().get(&DataKey::Config);
-        if let Some(old) = existing {
-            if old.decimals != config.decimals || old.asset_peg != config.asset_peg {
-                // Clear the legacy single-value price slot.
-                env.storage().instance().remove(&DataKey::Price);
-
-                // Clear every per-feeder submission and the submitter list itself.
-                // Submissions live in persistent() (see DataKey docs) so clears
-                // must target persistent storage and respect the cap.
-                let submitters: Vec<Address> = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Submitters)
-                    .unwrap_or(Vec::new(&env));
-                for feeder in submitters.iter() {
-                    env.storage()
-                        .persistent()
-                        .remove(&DataKey::Submission(feeder));
-                }
-                env.storage().persistent().remove(&DataKey::Submitters);
-            }
-        }
-
-        env.storage().instance().set(&DataKey::Config, &config);
-        events::oracle_configured(&env, &caller, config);
         Ok(())
+    }
+
+    /// Returns the denomination configured for fiat payout values, or `None`
+    /// until an admin supplies it through `update_oracle_config`.
+    pub fn quote_currency(env: Env) -> Option<soroban_sdk::Symbol> {
+        env.storage().instance().get(&DataKey::QuoteCurrency)
     }
 
     /// Submit a price observation. Gated strictly on `PriceFeeder` — `Admin`
@@ -509,6 +632,37 @@ impl TwapOracle {
             if config.max_price != 0 && price > config.max_price {
                 events::price_rejected(&env, &caller, price, symbol_short!("max_price"));
                 return Err(Error::PriceExceedsMaxPrice);
+            }
+
+            // Price deviation circuit breaker: reject price updates deviating too rapidly (Issue #680).
+            let max_deviation = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::MaxDeviationBps)
+                .unwrap_or(0);
+            if max_deviation > 0 {
+                if let Some(last_price_data) = env
+                    .storage()
+                    .instance()
+                    .get::<_, PriceData>(&DataKey::Price)
+                {
+                    if last_price_data.price > 0 {
+                        let diff = price.abs_diff(last_price_data.price);
+                        let deviation_bps = (diff as u128)
+                            .checked_mul(10_000)
+                            .ok_or(Error::ArithmeticOverflow)?
+                            / (last_price_data.price as u128);
+                        if deviation_bps > max_deviation as u128 {
+                            events::price_rejected(
+                                &env,
+                                &caller,
+                                price,
+                                symbol_short!("deviation"),
+                            );
+                            return Err(Error::ExcessivePriceDeviation);
+                        }
+                    }
+                }
             }
 
             // Rate-limit: reject a re-submission from this feeder if it arrives
@@ -583,6 +737,14 @@ impl TwapOracle {
             .get(&DataKey::Config)
             .ok_or(Error::OracleNotConfigured)?;
 
+        if env.storage().instance().has(&DataKey::PrimaryOracle)
+            || env.storage().instance().has(&DataKey::FallbackOracle)
+        {
+            if let Ok(price) = resolve_oracle_with_failover(&env, config.max_staleness) {
+                return Ok(price.price);
+            }
+        }
+
         let submitters: Vec<Address> = env
             .storage()
             .persistent()
@@ -606,6 +768,9 @@ impl TwapOracle {
         }
 
         if fresh_prices.is_empty() {
+            if let Ok(fallback_data) = resolve_oracle_with_failover(&env, config.max_staleness) {
+                return Ok(fallback_data.price);
+            }
             if saw_any_submission {
                 return Err(Error::OracleStalePrice);
             }
@@ -617,10 +782,93 @@ impl TwapOracle {
         // enough to return. `PriceStatus` exposes both counts so callers can
         // observe how far below quorum the set is.
         if fresh_prices.len() < config.min_submitters {
+            if let Ok(fallback_data) = resolve_oracle_with_failover(&env, config.max_staleness) {
+                return Ok(fallback_data.price);
+            }
             return Err(Error::InsufficientQuorum);
         }
 
         Ok(median(fresh_prices))
+    }
+
+    /// Configures both the `primary_oracle` and optional `fallback_oracle` feed addresses.
+    ///
+    /// When the primary oracle feed fails (unresponsive contract, missing data, or stale reading),
+    /// price queries automatically fail over to `fallback_oracle`.
+    pub fn set_oracle_feeds(
+        env: Env,
+        caller: Address,
+        primary_oracle: Address,
+        fallback_oracle: Option<Address>,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PrimaryOracle, &primary_oracle);
+        if let Some(fallback) = fallback_oracle {
+            env.storage()
+                .instance()
+                .set(&DataKey::FallbackOracle, &fallback);
+        } else {
+            env.storage().instance().remove(&DataKey::FallbackOracle);
+        }
+        Ok(())
+    }
+
+    /// Sets the primary oracle data provider / feed address. Admin-gated.
+    pub fn set_primary_oracle(
+        env: Env,
+        caller: Address,
+        primary_oracle: Address,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PrimaryOracle, &primary_oracle);
+        Ok(())
+    }
+
+    /// Sets the secondary fallback oracle data provider / feed address. Admin-gated.
+    pub fn set_fallback_oracle(
+        env: Env,
+        caller: Address,
+        fallback_oracle: Address,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::FallbackOracle, &fallback_oracle);
+        Ok(())
+    }
+
+    /// Read-only: returns the configured primary oracle address, if any.
+    pub fn primary_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PrimaryOracle)
+    }
+
+    /// Read-only: returns the configured fallback secondary oracle address, if any.
+    pub fn fallback_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::FallbackOracle)
+    }
+
+    /// Queries the primary oracle feed and automatically fails over to the secondary
+    /// `fallback_oracle` feed if the primary feed fails or is stale.
+    pub fn get_price_with_fallback(env: Env) -> Result<u64, Error> {
+        with_guard(&env, || {
+            let max_staleness = Self::max_staleness_seconds(env.clone());
+            if env.storage().instance().has(&DataKey::PrimaryOracle)
+                || env.storage().instance().has(&DataKey::FallbackOracle)
+            {
+                return resolve_oracle_with_failover(&env, max_staleness).map(|d| d.price);
+            }
+            Self::get_twap_price_inner(env.clone())
+        })
     }
 
     /// Read-only: the configured minimum-submitter quorum — how many distinct
@@ -656,6 +904,9 @@ impl TwapOracle {
     /// Errors:
     /// - `OracleNotConfigured` if `configure_oracle` has not been called.
     /// - `NoPriceAvailable` if no price has ever been submitted.
+    ///
+    /// Use this single view when both age and staleness are needed; it bundles
+    /// `newest_age`, `oldest_fresh_age`, `stale`, and quorum counts together.
     pub fn price_status(env: Env) -> Result<PriceStatus, Error> {
         load_price_status(&env)
     }
@@ -693,16 +944,24 @@ impl TwapOracle {
 
     /// Read-only: the most recent raw price submission from any feeder.
     ///
-    /// Returns the single most recent `PriceData` across all feeders, without any
-    /// TWAP aggregation or staleness checking. Useful for detecting anomalies in the
-    /// latest raw feed signal (e.g., a price spike) independently of the smoothed TWAP.
-    ///
-    /// The `updated_at` timestamp is the ledger time of the submission.
-    /// If multiple feeders submitted at the same block, returns one of them (order unspecified).
+    /// Returns the single most recent `PriceData` across all feeders.
+    /// Verifies that the observation has not exceeded the maximum staleness threshold,
+    /// returning `Error::StalePriceFeed` if `env.ledger().timestamp() - price.updated_at > max_staleness`.
     ///
     /// Errors:
     /// - `NoPriceAvailable` if no price has ever been submitted.
+    /// - `StalePriceFeed` if the last price update exceeds the staleness threshold.
     pub fn latest_price(env: Env) -> Result<PriceData, Error> {
+        let max_staleness = Self::max_staleness_seconds(env.clone());
+
+        if env.storage().instance().has(&DataKey::PrimaryOracle)
+            || env.storage().instance().has(&DataKey::FallbackOracle)
+        {
+            if let Ok(data) = resolve_oracle_with_failover(&env, max_staleness) {
+                return Ok(data);
+            }
+        }
+
         let submitters: Vec<Address> = env
             .storage()
             .persistent()
@@ -722,7 +981,120 @@ impl TwapOracle {
             }
         }
 
-        latest.ok_or(Error::NoPriceAvailable)
+        let price = latest
+            .or_else(|| env.storage().instance().get(&DataKey::Price))
+            .ok_or(Error::NoPriceAvailable)?;
+
+        if max_staleness > 0 {
+            let elapsed = env.ledger().timestamp().saturating_sub(price.updated_at);
+            if elapsed > max_staleness {
+                return Err(Error::StalePriceFeed);
+            }
+        }
+
+        Ok(price)
+    }
+
+    /// Read-only: returns the stored price checking staleness against max_staleness threshold.
+    pub fn get_stored_price(env: Env) -> Result<PriceData, Error> {
+        Self::latest_price(env)
+    }
+
+    /// Sets the maximum staleness seconds threshold for price feeds.
+    pub fn set_max_staleness_seconds(
+        env: Env,
+        caller: Address,
+        max_staleness_seconds: u64,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        if max_staleness_seconds == 0 {
+            return Err(Error::InvalidMaxStaleness);
+        }
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxStalenessSeconds, &max_staleness_seconds);
+        if let Some(mut config) = env
+            .storage()
+            .instance()
+            .get::<_, OracleConfig>(&DataKey::Config)
+        {
+            config.max_staleness = max_staleness_seconds;
+            env.storage().instance().set(&DataKey::Config, &config);
+        }
+        Ok(())
+    }
+
+    /// Sets the heartbeat timeout for a specific token's pair feed (Issue #850).
+    ///
+    /// The timeout is stored per token address in persistent storage, so
+    /// assets with different update cadences can use independent freshness
+    /// windows. A timeout of zero is rejected.
+    pub fn set_asset_oracle_config(
+        env: Env,
+        caller: Address,
+        token: Address,
+        config: AssetOracleConfig,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        if config.heartbeat_timeout_seconds == 0 {
+            return Err(Error::InvalidHeartbeatTimeout);
+        }
+
+        bump_instance(&env);
+        let key = DataKey::AssetOracleConfig(token);
+        env.storage().persistent().set(&key, &config);
+        ttl::bump_persistent(&env, &key);
+        Ok(())
+    }
+
+    /// Read-only: the per-token oracle configuration, if one has been set.
+    pub fn asset_oracle_config(env: Env, token: Address) -> Option<AssetOracleConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetOracleConfig(token))
+    }
+
+    /// Read-only: get configured maximum staleness seconds.
+    pub fn max_staleness_seconds(env: Env) -> u64 {
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<_, OracleConfig>(&DataKey::Config)
+        {
+            config.max_staleness
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::MaxStalenessSeconds)
+                .unwrap_or(0)
+        }
+    }
+
+    /// Sets the maximum allowable price deviation in basis points (1 bps = 0.01%, 1000 = 10%) (Issue #680).
+    /// Setting this to 0 disables deviation circuit breaker checks.
+    pub fn set_max_deviation_bps(
+        env: Env,
+        caller: Address,
+        max_deviation_bps: u32,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDeviationBps, &max_deviation_bps);
+        Ok(())
+    }
+
+    /// Read-only: returns the configured maximum price deviation in basis points, or 0 if disabled (Issue #680).
+    pub fn max_deviation_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxDeviationBps)
+            .unwrap_or(0)
     }
 
     /// Converts a nominal token amount into its fiat equivalent.
@@ -761,6 +1133,152 @@ impl TwapOracle {
         }
 
         Ok(value as u64)
+    }
+
+    /// Submit a price report for a token pair (base/quote) identified by `Address`.
+    ///
+    /// Up to five authorized reporters are tracked per pair. `get_price`
+    /// returns the median of reports no older than 15 minutes, preventing one
+    /// reporter from unilaterally setting the pair price.
+    pub fn set_price(
+        env: Env,
+        caller: Address,
+        base: Address,
+        quote: Address,
+        price: u128,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::PriceFeeder)?;
+        if price == 0 {
+            return Err(Error::InvalidPrice);
+        }
+
+        bump_instance(&env);
+        add_pair_reporter(&env, &base, &quote, &caller)?;
+
+        let data = PairPriceData {
+            price,
+            updated_at: env.ledger().timestamp(),
+        };
+        let submission_key = DataKey::PairSubmission(base.clone(), quote.clone(), caller.clone());
+        env.storage().persistent().set(&submission_key, &data);
+        ttl::bump_persistent(&env, &submission_key);
+
+        // Keep the historical scalar populated for upgrade compatibility. New
+        // reads prefer the timestamped reporter set above.
+        env.storage()
+            .instance()
+            .set(&DataKey::PairPrice(base, quote), &price);
+        Ok(())
+    }
+
+    /// Returns the decentralized median price for an Address pair.
+    ///
+    /// Only reports submitted within the last 15 minutes by reporters that
+    /// remain authorized are included. If a contract predates pair-report
+    /// aggregation and has no reporter index yet, the legacy scalar is
+    /// returned as a migration fallback.
+    pub fn get_price(env: Env, base: Address, quote: Address) -> Result<u128, Error> {
+        aggregate_pair_price(&env, &base, &quote)
+    }
+
+    /// Fetches the direct pair median, or the reciprocal median for the reverse pair.
+    pub fn get_price_inverted(env: Env, base: Address, quote: Address) -> Result<u128, Error> {
+        let direct_err = match aggregate_pair_price(&env, &base, &quote) {
+            Ok(price) => return Ok(price),
+            Err(err @ Error::PriceNotFound) | Err(err @ Error::OracleStalePrice) => err,
+            Err(err) => return Err(err),
+        };
+
+        match aggregate_pair_price(&env, &quote, &base) {
+            Ok(price) => {
+                if price == 0 {
+                    return Err(Error::InvalidPrice);
+                }
+                let precision_sq = PRICE_PRECISION
+                    .checked_mul(PRICE_PRECISION)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                precision_sq
+                    .checked_div(price)
+                    .ok_or(Error::ArithmeticOverflow)
+            }
+            Err(reverse_err) => {
+                if direct_err == Error::OracleStalePrice || reverse_err == Error::OracleStalePrice {
+                    Err(Error::OracleStalePrice)
+                } else {
+                    Err(Error::PriceNotFound)
+                }
+            }
+        }
+    }
+
+    /// Submit a price report for a symbol pair (e.g. XLM/USDC).
+    ///
+    /// Uses the same five-reporter / 15-minute median policy as Address pairs.
+    pub fn set_price_symbol(
+        env: Env,
+        caller: Address,
+        base: Symbol,
+        quote: Symbol,
+        price: u128,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::PriceFeeder)?;
+        if price == 0 {
+            return Err(Error::InvalidPrice);
+        }
+
+        bump_instance(&env);
+        add_symbol_pair_reporter(&env, &base, &quote, &caller)?;
+
+        let data = PairPriceData {
+            price,
+            updated_at: env.ledger().timestamp(),
+        };
+        let submission_key =
+            DataKey::PairSymbolSubmission(base.clone(), quote.clone(), caller.clone());
+        env.storage().persistent().set(&submission_key, &data);
+        ttl::bump_persistent(&env, &submission_key);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PairPriceSymbol(base, quote), &price);
+        Ok(())
+    }
+
+    /// Returns the decentralized median price for a symbol pair.
+    pub fn get_price_symbol(env: Env, base: Symbol, quote: Symbol) -> Result<u128, Error> {
+        aggregate_symbol_pair_price(&env, &base, &quote)
+    }
+
+    /// Fetches the direct symbol-pair median, or the reciprocal reverse-pair median.
+    pub fn get_price_inverted_symbol(env: Env, base: Symbol, quote: Symbol) -> Result<u128, Error> {
+        let direct_err = match aggregate_symbol_pair_price(&env, &base, &quote) {
+            Ok(price) => return Ok(price),
+            Err(err @ Error::PriceNotFound) | Err(err @ Error::OracleStalePrice) => err,
+            Err(err) => return Err(err),
+        };
+
+        match aggregate_symbol_pair_price(&env, &quote, &base) {
+            Ok(price) => {
+                if price == 0 {
+                    return Err(Error::InvalidPrice);
+                }
+                let precision_sq = PRICE_PRECISION
+                    .checked_mul(PRICE_PRECISION)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                precision_sq
+                    .checked_div(price)
+                    .ok_or(Error::ArithmeticOverflow)
+            }
+            Err(reverse_err) => {
+                if direct_err == Error::OracleStalePrice || reverse_err == Error::OracleStalePrice {
+                    Err(Error::OracleStalePrice)
+                } else {
+                    Err(Error::PriceNotFound)
+                }
+            }
+        }
     }
 
     // ── Emergency pause (Pauser or Admin-gated) ──────────────────────────
@@ -838,6 +1356,343 @@ impl TwapOracle {
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         events::upgraded(&env, &caller, env.ledger().timestamp());
         Ok(())
+    }
+}
+
+/// Queries a single oracle provider address (either a local feeder submission or an
+/// external oracle contract implementing `get_twap_price` / `latest_price`).
+fn query_oracle_feed(env: &Env, feed: &Address, max_staleness: u64) -> Result<PriceData, Error> {
+    let now = env.ledger().timestamp();
+
+    // 1. Check if `feed` has a direct submission stored in this contract.
+    if let Some(data) = env
+        .storage()
+        .persistent()
+        .get::<_, PriceData>(&DataKey::Submission(feed.clone()))
+    {
+        if data.price == 0 {
+            return Err(Error::InvalidPrice);
+        }
+        if max_staleness > 0 && now.saturating_sub(data.updated_at) > max_staleness {
+            return Err(Error::OracleStalePrice);
+        }
+        return Ok(data);
+    }
+
+    // 2. Otherwise, if `feed` is an external oracle contract, try invoking its price endpoints.
+    if feed != &env.current_contract_address() {
+        let twap_res = env.try_invoke_contract::<u64, Error>(
+            feed,
+            &Symbol::new(env, "get_twap_price"),
+            Vec::new(env),
+        );
+        if let Ok(Ok(price)) = twap_res {
+            if price > 0 {
+                return Ok(PriceData {
+                    price,
+                    updated_at: now,
+                });
+            }
+        }
+
+        let latest_res = env.try_invoke_contract::<PriceData, Error>(
+            feed,
+            &Symbol::new(env, "latest_price"),
+            Vec::new(env),
+        );
+        if let Ok(Ok(data)) = latest_res {
+            if data.price > 0
+                && (max_staleness == 0 || now.saturating_sub(data.updated_at) <= max_staleness)
+            {
+                return Ok(data);
+            }
+        }
+    }
+
+    Err(Error::NoPriceAvailable)
+}
+
+/// Queries `primary_oracle` first and automatically fails over to `fallback_oracle`
+/// if the primary oracle feed fails, is unresponsive, or has stale data.
+fn resolve_oracle_with_failover(env: &Env, max_staleness: u64) -> Result<PriceData, Error> {
+    let primary: Option<Address> = env.storage().instance().get(&DataKey::PrimaryOracle);
+    let fallback: Option<Address> = env.storage().instance().get(&DataKey::FallbackOracle);
+
+    let mut primary_err = Error::NoPriceAvailable;
+    if let Some(ref primary_addr) = primary {
+        match query_oracle_feed(env, primary_addr, max_staleness) {
+            Ok(data) => return Ok(data),
+            Err(err) => primary_err = err,
+        }
+    }
+
+    if let Some(ref fallback_addr) = fallback {
+        if let Ok(data) = query_oracle_feed(env, fallback_addr, max_staleness) {
+            return Ok(data);
+        }
+    }
+
+    Err(primary_err)
+}
+
+fn store_oracle_config(env: &Env, caller: &Address, config: OracleConfig) -> Result<(), Error> {
+    if config.decimals > 19 {
+        return Err(Error::InvalidDecimals);
+    }
+
+    if config.max_staleness == 0 {
+        return Err(Error::InvalidMaxStaleness);
+    }
+
+    if config.min_submitters == 0 || config.min_submitters > MAX_SUBMITTERS {
+        return Err(Error::InvalidMinSubmitters);
+    }
+
+    bump_instance(env);
+
+    let existing: Option<OracleConfig> = env.storage().instance().get(&DataKey::Config);
+    if let Some(old) = existing {
+        if old.decimals != config.decimals || old.asset_peg != config.asset_peg {
+            env.storage().instance().remove(&DataKey::Price);
+
+            let submitters: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Submitters)
+                .unwrap_or(Vec::new(env));
+            for feeder in submitters.iter() {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Submission(feeder));
+            }
+            env.storage().persistent().remove(&DataKey::Submitters);
+        }
+    }
+
+    env.storage().instance().set(&DataKey::Config, &config);
+    events::oracle_configured(env, caller, config);
+    Ok(())
+}
+
+/// True while a reporter may contribute to pair-price aggregation.
+fn is_authorized_pair_reporter(env: &Env, reporter: &Address) -> bool {
+    has_role(env, Role::PriceFeeder, reporter) || has_role(env, Role::Admin, reporter)
+}
+
+fn add_pair_reporter(
+    env: &Env,
+    base: &Address,
+    quote: &Address,
+    reporter: &Address,
+) -> Result<(), Error> {
+    let key = DataKey::PairReporters(base.clone(), quote.clone());
+    let existing: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+
+    let mut active = Vec::new(env);
+    let mut already_present = false;
+    for account in existing.iter() {
+        if is_authorized_pair_reporter(env, &account) {
+            if account == *reporter {
+                already_present = true;
+            }
+            active.push_back(account);
+        }
+    }
+
+    if !already_present {
+        if active.len() >= MAX_PAIR_REPORTERS {
+            return Err(Error::TooManyPairReporters);
+        }
+        active.push_back(reporter.clone());
+    }
+
+    env.storage().persistent().set(&key, &active);
+    ttl::bump_persistent(env, &key);
+    Ok(())
+}
+
+fn add_symbol_pair_reporter(
+    env: &Env,
+    base: &Symbol,
+    quote: &Symbol,
+    reporter: &Address,
+) -> Result<(), Error> {
+    let key = DataKey::PairSymbolReporters(base.clone(), quote.clone());
+    let existing: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+
+    let mut active = Vec::new(env);
+    let mut already_present = false;
+    for account in existing.iter() {
+        if is_authorized_pair_reporter(env, &account) {
+            if account == *reporter {
+                already_present = true;
+            }
+            active.push_back(account);
+        }
+    }
+
+    if !already_present {
+        if active.len() >= MAX_PAIR_REPORTERS {
+            return Err(Error::TooManyPairReporters);
+        }
+        active.push_back(reporter.clone());
+    }
+
+    env.storage().persistent().set(&key, &active);
+    ttl::bump_persistent(env, &key);
+    Ok(())
+}
+
+/// Freshness window for reports on `asset`.
+///
+/// Uses the per-token heartbeat when configured (Issue #850), otherwise falls
+/// back to the global staleness setting and finally the legacy pair window for
+/// deployments that never configured either.
+fn asset_heartbeat_secs(env: &Env, asset: &Address) -> u64 {
+    if let Some(config) = env
+        .storage()
+        .persistent()
+        .get::<_, AssetOracleConfig>(&DataKey::AssetOracleConfig(asset.clone()))
+    {
+        return config.heartbeat_timeout_seconds;
+    }
+
+    let global = TwapOracle::max_staleness_seconds(env.clone());
+    if global > 0 {
+        global
+    } else {
+        PAIR_REPORT_FRESHNESS_SECS
+    }
+}
+
+fn aggregate_pair_price(env: &Env, base: &Address, quote: &Address) -> Result<u128, Error> {
+    let heartbeat = asset_heartbeat_secs(env, base);
+    let reporters_key = DataKey::PairReporters(base.clone(), quote.clone());
+    let reporters: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&reporters_key)
+        .unwrap_or(Vec::new(env));
+
+    // Upgrade compatibility for feeds written before pair aggregation existed.
+    if reporters.is_empty() {
+        return env
+            .storage()
+            .instance()
+            .get(&DataKey::PairPrice(base.clone(), quote.clone()))
+            .ok_or(Error::PriceNotFound);
+    }
+
+    let now = env.ledger().timestamp();
+    let mut fresh = Vec::new(env);
+    let mut saw_authorized_submission = false;
+
+    for reporter in reporters.iter() {
+        if !is_authorized_pair_reporter(env, &reporter) {
+            continue;
+        }
+        let key = DataKey::PairSubmission(base.clone(), quote.clone(), reporter);
+        if let Some(data) = env.storage().persistent().get::<_, PairPriceData>(&key) {
+            saw_authorized_submission = true;
+            if now.saturating_sub(data.updated_at) <= heartbeat {
+                fresh.push_back(data.price);
+            }
+        }
+    }
+
+    if fresh.is_empty() {
+        return if saw_authorized_submission {
+            Err(Error::OracleStalePrice)
+        } else {
+            Err(Error::PriceNotFound)
+        };
+    }
+
+    Ok(median_u128(fresh))
+}
+
+fn aggregate_symbol_pair_price(env: &Env, base: &Symbol, quote: &Symbol) -> Result<u128, Error> {
+    let reporters_key = DataKey::PairSymbolReporters(base.clone(), quote.clone());
+    let reporters: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&reporters_key)
+        .unwrap_or(Vec::new(env));
+
+    if reporters.is_empty() {
+        return env
+            .storage()
+            .instance()
+            .get(&DataKey::PairPriceSymbol(base.clone(), quote.clone()))
+            .ok_or(Error::PriceNotFound);
+    }
+
+    let now = env.ledger().timestamp();
+    let mut fresh = Vec::new(env);
+    let mut saw_authorized_submission = false;
+
+    for reporter in reporters.iter() {
+        if !is_authorized_pair_reporter(env, &reporter) {
+            continue;
+        }
+        let key = DataKey::PairSymbolSubmission(base.clone(), quote.clone(), reporter);
+        if let Some(data) = env.storage().persistent().get::<_, PairPriceData>(&key) {
+            saw_authorized_submission = true;
+            if now.saturating_sub(data.updated_at) <= PAIR_REPORT_FRESHNESS_SECS {
+                fresh.push_back(data.price);
+            }
+        }
+    }
+
+    if fresh.is_empty() {
+        return if saw_authorized_submission {
+            Err(Error::OracleStalePrice)
+        } else {
+            Err(Error::PriceNotFound)
+        };
+    }
+
+    Ok(median_u128(fresh))
+}
+
+fn median_u128(values: Vec<u128>) -> u128 {
+    let len = values.len();
+    let mut sorted = values.clone();
+    let mut i: u32 = 1;
+    while i < len {
+        let key = sorted.get(i).unwrap();
+        let mut j = i;
+        while j > 0 {
+            let prev = sorted.get(j - 1).unwrap();
+            if prev <= key {
+                break;
+            }
+            sorted.set(j, prev);
+            j -= 1;
+        }
+        sorted.set(j, key);
+        i += 1;
+    }
+
+    let mid = len / 2;
+    if len & 1 == 0 {
+        let a = sorted.get(mid - 1).unwrap();
+        let b = sorted.get(mid).unwrap();
+        // Overflow-safe integer average. Avoid `a + b`, which can overflow
+        // for valid u128 prices even though their median is representable.
+        (a / 2)
+            .saturating_add(b / 2)
+            .saturating_add(((a % 2) + (b % 2)) / 2)
+    } else {
+        sorted.get(mid).unwrap()
     }
 }
 
@@ -946,6 +1801,7 @@ fn add_submitter(env: &Env, account: &Address) -> Result<(), Error> {
 
     for existing in submitters.iter() {
         if existing == *account {
+            ttl::bump_persistent(env, &DataKey::Submitters);
             return Ok(());
         }
     }
@@ -1135,7 +1991,7 @@ fn is_paused(env: &Env) -> bool {
 /// Writes the emergency-pause flag. Only `pause`/`unpause` call this, and both
 /// have already gated the caller and the transition.
 fn set_paused(env: &Env, paused: bool) {
-    pause::set_paused(env, &DataKey::Paused, paused);
+    let _ = pause::set_paused(env, &DataKey::Paused, paused);
 }
 
 /// The pause gate: `Err(ContractPaused)` while the oracle is halted.
@@ -1221,6 +2077,11 @@ mod events {
     pub fn oracle_configured(env: &Env, caller: &Address, config: super::OracleConfig) {
         env.events()
             .publish((symbol_short!("ocfg"), caller.clone()), config);
+    }
+
+    pub fn quote_currency_configured(env: &Env, caller: &Address, currency: soroban_sdk::Symbol) {
+        env.events()
+            .publish((symbol_short!("qcurr"), caller.clone()), currency);
     }
 
     /// Emitted when a price submission is rejected so off-chain monitors
@@ -2832,5 +3693,425 @@ mod tests {
             result.is_ok(),
             "first-ever submission must bypass the interval check"
         );
+    }
+
+    // ── Issue #695: decentralized pair-price aggregation ───────────────────
+
+    #[test]
+    fn per_asset_heartbeat_timeout_overrides_global_freshness() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+
+        let heartbeat = AssetOracleConfig {
+            heartbeat_timeout_seconds: 60,
+        };
+        client.set_asset_oracle_config(&admin, &base, &heartbeat);
+        assert_eq!(client.asset_oracle_config(&base), Some(heartbeat));
+
+        let start = env.ledger().timestamp();
+        client.set_price(&feeder, &base, &quote, &100u128);
+
+        env.ledger().set_timestamp(start + 60);
+        assert_eq!(client.get_price(&base, &quote), 100u128);
+
+        env.ledger().set_timestamp(start + 61);
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleStalePrice))
+        );
+    }
+
+    #[test]
+    fn asset_oracle_config_rejects_zero_heartbeat() {
+        let (_env, client, admin) = setup();
+        client.initialize(&admin);
+        let token = Address::generate(&_env);
+
+        assert_eq!(
+            client.try_set_asset_oracle_config(
+                &admin,
+                &token,
+                &AssetOracleConfig {
+                    heartbeat_timeout_seconds: 0,
+                },
+            ),
+            Err(Ok(Error::InvalidHeartbeatTimeout))
+        );
+    }
+
+    #[test]
+    fn pair_price_uses_median_of_fresh_authorized_reporters() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let f1 = Address::generate(&env);
+        let f2 = Address::generate(&env);
+        let f3 = Address::generate(&env);
+
+        for feeder in [f1.clone(), f2.clone(), f3.clone()] {
+            client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        }
+
+        client.set_price(&f1, &base, &quote, &100u128);
+        client.set_price(&f2, &base, &quote, &300u128);
+        client.set_price(&f3, &base, &quote, &200u128);
+
+        assert_eq!(client.get_price(&base, &quote), 200u128);
+    }
+
+    #[test]
+    fn pair_price_ignores_stale_reports_and_errors_when_all_are_stale() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let f1 = Address::generate(&env);
+        let f2 = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &f1);
+        client.grant_role(&admin, &Role::PriceFeeder, &f2);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        client.set_price(&f1, &base, &quote, &100u128);
+
+        // f1 is now older than the 15-minute pair-report window.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_901,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        client.set_price(&f2, &base, &quote, &250u128);
+        assert_eq!(client.get_price(&base, &quote), 250u128);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_001_802,
+            protocol_version: 21,
+            sequence_number: 3,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleStalePrice))
+        );
+    }
+
+    #[test]
+    fn pair_price_caps_active_reporters_at_five() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let mut feeders = std::vec::Vec::new();
+
+        for _ in 0..6 {
+            let feeder = Address::generate(&env);
+            client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+            feeders.push(feeder);
+        }
+
+        for feeder in feeders.iter().take(5) {
+            client.set_price(feeder, &base, &quote, &100u128);
+        }
+
+        assert_eq!(
+            client.try_set_price(&feeders[5], &base, &quote, &100u128),
+            Err(Ok(Error::TooManyPairReporters))
+        );
+    }
+
+    #[test]
+    fn symbol_pair_price_uses_the_same_median_policy() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = symbol_short!("XLM");
+        let quote = symbol_short!("USDC");
+        let f1 = Address::generate(&env);
+        let f2 = Address::generate(&env);
+        let f3 = Address::generate(&env);
+
+        for feeder in [f1.clone(), f2.clone(), f3.clone()] {
+            client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        }
+
+        client.set_price_symbol(&f1, &base, &quote, &20_000_000u128);
+        client.set_price_symbol(&f2, &base, &quote, &21_000_000u128);
+        client.set_price_symbol(&f3, &base, &quote, &19_000_000u128);
+
+        assert_eq!(client.get_price_symbol(&base, &quote), 20_000_000u128);
+    }
+
+    // ── Pair price and inverted price calculation tests ───────────────────
+
+    #[test]
+    fn get_price_returns_direct_price_or_price_not_found() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+
+        // Not set yet
+        assert_eq!(
+            client.try_get_price(&token_a, &token_b),
+            Err(Ok(Error::PriceNotFound))
+        );
+
+        // Admin sets price
+        client.set_price(&admin, &token_a, &token_b, &20_000_000u128);
+
+        // Direct lookup returns stored price
+        assert_eq!(client.get_price(&token_a, &token_b), 20_000_000u128);
+
+        // Reverse lookup on get_price returns PriceNotFound
+        assert_eq!(
+            client.try_get_price(&token_b, &token_a),
+            Err(Ok(Error::PriceNotFound))
+        );
+    }
+
+    #[test]
+    fn get_price_inverted_calculates_reciprocal_when_direct_feed_absent() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let xlm = Address::generate(&env);
+        let usdc = Address::generate(&env);
+
+        // When neither feed exists, get_price_inverted returns PriceNotFound
+        assert_eq!(
+            client.try_get_price_inverted(&xlm, &usdc),
+            Err(Ok(Error::PriceNotFound))
+        );
+
+        // Set XLM/USDC price = 0.20 (20_000_000 with 8 decimals)
+        let xlm_price = 20_000_000u128;
+        client.set_price(&admin, &xlm, &usdc, &xlm_price);
+
+        // Direct feed query via get_price_inverted returns direct price
+        assert_eq!(client.get_price_inverted(&xlm, &usdc), xlm_price);
+
+        // Reverse query USDC/XLM via get_price_inverted:
+        // (PRICE_PRECISION^2 / price) = (10^16 / 20_000_000) = 500_000_000 (5.00 XLM per USDC)
+        let expected_inverted = 500_000_000u128;
+        assert_eq!(client.get_price_inverted(&usdc, &xlm), expected_inverted);
+    }
+
+    #[test]
+    fn pair_price_symbols_direct_and_inverted() {
+        let (_env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let xlm = symbol_short!("XLM");
+        let usdc = symbol_short!("USDC");
+
+        // Set XLM/USDC = 0.20
+        client.set_price_symbol(&admin, &xlm, &usdc, &20_000_000u128);
+
+        // Direct
+        assert_eq!(client.get_price_symbol(&xlm, &usdc), 20_000_000u128);
+        assert_eq!(
+            client.get_price_inverted_symbol(&xlm, &usdc),
+            20_000_000u128
+        );
+
+        // Reverse get_price_symbol gives PriceNotFound
+        assert_eq!(
+            client.try_get_price_symbol(&usdc, &xlm),
+            Err(Ok(Error::PriceNotFound))
+        );
+
+        // Reverse get_price_inverted_symbol gives inverted price: 10^16 / 20_000_000 = 500_000_000
+        assert_eq!(
+            client.get_price_inverted_symbol(&usdc, &xlm),
+            500_000_000u128
+        );
+    }
+
+    #[test]
+    fn set_price_guards_auth_zero_and_pause() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let unauth = Address::generate(&env);
+
+        // Unauthorized caller rejected
+        assert_eq!(
+            client.try_set_price(&unauth, &token_a, &token_b, &100_000_000u128),
+            Err(Ok(Error::NotAuthorized))
+        );
+
+        // Zero price rejected
+        assert_eq!(
+            client.try_set_price(&admin, &token_a, &token_b, &0u128),
+            Err(Ok(Error::InvalidPrice))
+        );
+
+        // Pause blocks setting price
+        client.pause(&admin);
+        assert_eq!(
+            client.try_set_price(&admin, &token_a, &token_b, &100_000_000u128),
+            Err(Ok(Error::ContractPaused))
+        );
+    }
+
+    #[test]
+    fn test_latest_price_enforces_staleness_threshold() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+
+        // Configure oracle with max_staleness = 300 seconds
+        let config = OracleConfig {
+            decimals: 8,
+            asset_peg: 1,
+            max_staleness: 300,
+            max_price: 1_000_000_000,
+            min_submit_interval: 0,
+            min_submitters: 1,
+        };
+        client.configure_oracle(&admin, &config);
+
+        // Submitting price at t=0
+        client.submit_price(&feeder, &50_000_000);
+
+        // Fresh price returns successfully
+        let price_data = client.latest_price();
+        assert_eq!(price_data.price, 50_000_000);
+
+        // Boundary test: elapsed == max_staleness (300s) -> still fresh
+        let current_time = env.ledger().timestamp();
+        env.ledger().set_timestamp(current_time + 300);
+        assert!(client.try_latest_price().is_ok());
+
+        // Boundary test: elapsed > max_staleness (301s) -> StalePriceFeed
+        env.ledger().set_timestamp(current_time + 301);
+        let res = client.try_latest_price();
+        assert_eq!(res, Err(Ok(Error::StalePriceFeed)));
+
+        // get_stored_price alias also returns StalePriceFeed
+        assert_eq!(
+            client.try_get_stored_price(),
+            Err(Ok(Error::StalePriceFeed))
+        );
+
+        // Submitting fresh price restores health
+        client.submit_price(&feeder, &52_000_000);
+        assert_eq!(client.latest_price().price, 52_000_000);
+    }
+
+    #[test]
+    fn test_price_deviation_circuit_breaker() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+
+        let config = OracleConfig {
+            decimals: 8,
+            asset_peg: 1,
+            max_staleness: 300,
+            max_price: 1_000_000_000,
+            min_submit_interval: 0,
+            min_submitters: 1,
+        };
+        client.configure_oracle(&admin, &config);
+
+        // Initial price submission at 100
+        client.submit_price(&feeder, &100_000_000);
+
+        // Set max_deviation_bps to 1000 (10%)
+        client.set_max_deviation_bps(&admin, &1000);
+        assert_eq!(client.max_deviation_bps(), 1000);
+
+        // A 5% increase (to 105) is within 10% tolerance -> succeeds
+        assert!(client.try_submit_price(&feeder, &105_000_000).is_ok());
+
+        // A sudden drop from 105 to 50 is ~52% deviation (> 10%) -> rejected
+        assert_eq!(
+            client.try_submit_price(&feeder, &50_000_000),
+            Err(Ok(Error::ExcessivePriceDeviation))
+        );
+
+        // A sudden surge from 105 to 200 is ~90% deviation (> 10%) -> rejected
+        assert_eq!(
+            client.try_submit_price(&feeder, &200_000_000),
+            Err(Ok(Error::ExcessivePriceDeviation))
+        );
+
+        // Disabling deviation checks (set to 0) allows any price change
+        client.set_max_deviation_bps(&admin, &0);
+        assert!(client.try_submit_price(&feeder, &50_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_fallback_oracle_feed_automatic_failover() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let config = OracleConfig {
+            decimals: 8,
+            asset_peg: 1,
+            max_staleness: 300,
+            max_price: 0,
+            min_submit_interval: 0,
+            min_submitters: 1,
+        };
+        client.configure_oracle(&admin, &config);
+
+        // Register a secondary oracle contract as fallback
+        let fallback_id = env.register_contract(None, TwapOracle);
+        let fallback_client = TwapOracleClient::new(&env, &fallback_id);
+        fallback_client.initialize(&admin);
+        fallback_client.configure_oracle(&admin, &config);
+        let fallback_feeder = Address::generate(&env);
+        fallback_client.grant_role(&admin, &Role::PriceFeeder, &fallback_feeder);
+        fallback_client.submit_price(&fallback_feeder, &250_000_000);
+
+        let primary_feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &primary_feeder);
+        client.set_oracle_feeds(&admin, &primary_feeder, &Some(fallback_id.clone()));
+
+        assert_eq!(client.primary_oracle(), Some(primary_feeder.clone()));
+        assert_eq!(client.fallback_oracle(), Some(fallback_id.clone()));
+
+        // Primary feeder hasn't submitted yet -> automatically fails over to fallback oracle (250_000_000)
+        assert_eq!(client.get_twap_price(), 250_000_000);
+        assert_eq!(client.get_price_with_fallback(), 250_000_000);
+
+        // Primary feeder submits fresh price -> primary takes precedence (300_000_000)
+        client.submit_price(&primary_feeder, &300_000_000);
+        assert_eq!(client.get_twap_price(), 300_000_000);
+        assert_eq!(client.get_price_with_fallback(), 300_000_000);
     }
 }

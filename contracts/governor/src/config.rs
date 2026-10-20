@@ -3,6 +3,10 @@ use soroban_sdk::{contracttype, Address, Env};
 use crate::storage::DataKey;
 use crate::Error;
 
+/// Minimum voting period: 17280 ledgers (~1 day on Soroban) (Issue #772).
+/// Prevents flash-loan voting attacks and allows DAO participants time to react.
+pub const MIN_VOTING_PERIOD_LEDGERS: u32 = 17280;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct GovernorConfig {
@@ -17,6 +21,10 @@ pub struct GovernorConfig {
     /// (e.g. 7 days for payroll, 90 days for long-horizon vesting) instead
     /// of the previously hardcoded 30-day constant.
     pub force_cancel_pause_secs: u64,
+    /// Minimum quorum threshold in basis points (10,000 = 100%).
+    pub min_quorum_bps: u32,
+    /// Minimum voting period in ledger sequences (Issue #772).
+    pub voting_period_ledgers: u32,
 }
 
 /// Load the governor configuration from instance storage.
@@ -43,5 +51,27 @@ pub fn load(env: &Env) -> Result<GovernorConfig, Error> {
             .unwrap_or(1_000_000_000_000_000),
         factory_address,
         force_cancel_pause_secs: s.get(&DataKey::ForceCancelPauseSecs).unwrap_or(2_592_000), // 30 days
+        min_quorum_bps: s.get(&DataKey::MinQuorumBps).unwrap_or(0),
+        voting_period_ledgers: s.get(&DataKey::VotingPeriodLedgers).unwrap_or(MIN_VOTING_PERIOD_LEDGERS),
     })
+}
+
+/// Validate and set the minimum voting period (Issue #772).
+/// Ensures voting period is at least MIN_VOTING_PERIOD_LEDGERS to prevent attacks.
+pub fn set_voting_period(env: &Env, voting_period_ledgers: u32) -> Result<(), Error> {
+    if voting_period_ledgers < MIN_VOTING_PERIOD_LEDGERS {
+        return Err(Error::InvalidParam);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::VotingPeriodLedgers, &voting_period_ledgers);
+    Ok(())
+}
+
+/// Get the current voting period in ledgers.
+pub fn get_voting_period(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::VotingPeriodLedgers)
+        .unwrap_or(MIN_VOTING_PERIOD_LEDGERS)
 }

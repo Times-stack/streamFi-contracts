@@ -10,7 +10,16 @@
 //! Soroban transaction, so either both commit or both roll back — an event
 //! is never emitted for a transition that did not actually persist.
 
-use soroban_sdk::{symbol_short, Address, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+
+/// Event data payload detailing the fee breakdown for deposits (Issue #687).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositEvent {
+    pub gross_amount: i128,
+    pub fee_amount: i128,
+    pub net_amount: i128,
+}
 
 /// Emitted by `initialize` when the vault is first set up.
 ///
@@ -33,6 +42,26 @@ pub fn deposited(env: &Env, from: &Address, amount: i128, new_balance: i128) {
         (symbol_short!("deposited"), from.clone()),
         (amount, new_balance),
     );
+}
+
+/// Emitted on deposit to publish a complete fee breakdown for financial accounting (Issue #687).
+///
+/// Topics: `("TokenDeposited", from)`
+/// Data:   `DepositEvent { gross_amount, fee_amount, net_amount }`
+pub fn token_deposited(
+    env: &Env,
+    from: &Address,
+    gross_amount: i128,
+    fee_amount: i128,
+    net_amount: i128,
+) {
+    let payload = DepositEvent {
+        gross_amount,
+        fee_amount,
+        net_amount,
+    };
+    env.events()
+        .publish((Symbol::new(env, "TokenDeposited"), from.clone()), payload);
 }
 
 /// Emitted by `withdraw` after tokens are paid out of the vault.
@@ -150,4 +179,57 @@ pub fn owner_proposed(env: &Env, caller: &Address, new_owner: &Address) {
 pub fn owner_accepted(env: &Env, caller: &Address, old_owner: &Address) {
     env.events()
         .publish((symbol_short!("accept"), caller.clone()), old_owner.clone());
+}
+
+pub fn owner_proposal_ttl_set(env: &Env, caller: &Address, old_ttl: u64, new_ttl: u64) {
+    env.events().publish(
+        (symbol_short!("owner_ttl"), caller.clone()),
+        (old_ttl, new_ttl),
+    );
+}
+
+/// Emitted by `initiate_emergency_migration` when a cold storage migration is scheduled (Issue #679).
+///
+/// Topics: `("em_init", caller)` — the owner.
+/// Data:   `(destination, executable_at)`
+pub fn emergency_migration_initiated(
+    env: &Env,
+    caller: &Address,
+    destination: &Address,
+    executable_at: u64,
+) {
+    env.events().publish(
+        (symbol_short!("em_init"), caller.clone()),
+        (destination.clone(), executable_at),
+    );
+}
+
+/// Emitted by `execute_emergency_migration` when a cold storage migration is executed (Issue #679).
+///
+/// Topics: `("em_exec", caller)` — the owner.
+/// Data:   `(destination, amount)`
+pub fn emergency_migration_executed(
+    env: &Env,
+    caller: &Address,
+    destination: &Address,
+    amount: i128,
+) {
+    env.events().publish(
+        (symbol_short!("em_exec"), caller.clone()),
+        (destination.clone(), amount),
+    );
+}
+
+/// Emitted by `cancel_emergency_migration` when a pending migration is cancelled (Issue #679).
+///
+/// Topics: `("em_cancel", caller)` — the owner.
+/// Data:   ()
+pub fn emergency_migration_cancelled(env: &Env, caller: &Address) {
+    env.events()
+        .publish((symbol_short!("em_cancel"), caller.clone()), ());
+}
+
+pub fn kept_alive(env: &Env, new_ttl: u32) {
+    env.events()
+        .publish((Symbol::new(env, "kept_alive"),), new_ttl);
 }

@@ -24,14 +24,17 @@ mod storage;
 mod tests;
 mod ttl;
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 use drip_common::is_zero_address;
 
 pub use config::GovernorConfig;
 pub use errors::Error;
-pub use role::Role;
+pub use role::{Role, RoleMembersPage};
 use storage::DataKey;
+pub use storage::{BalanceCheckpoint, Proposal, ProposalStatus, VoteTallySnapshot};
 
 /// Returns `true` when the governor is under an emergency pause.
 ///
@@ -48,7 +51,7 @@ fn is_paused(env: &Env) -> bool {
 /// Writes the emergency-pause flag. Only `governor_pause`/`governor_unpause`
 /// call this, and both have already gated the caller and the transition.
 fn set_paused(env: &Env, paused: bool) {
-    drip_common::pause::set_paused(env, &DataKey::Paused, paused);
+    let _ = drip_common::pause::set_paused(env, &DataKey::Paused, paused);
 }
 
 /// Assert that the governor is not paused. Returns `ContractPaused` if it is.
@@ -94,6 +97,7 @@ impl DripGovernor {
         s.set(&DataKey::MaxRatePerSecond, &1_000_000_000_000_000_i128);
         s.set(&DataKey::FactoryAddress, &factory_address);
         s.set(&DataKey::ForceCancelPauseSecs, &2_592_000_u64); // 30 days
+        s.set(&DataKey::MinQuorumBps, &0_u32);
 
         role::grant(&env, Role::Admin, &authority);
         role::grant(&env, Role::FeeManager, &authority);
@@ -109,6 +113,16 @@ impl DripGovernor {
     /// Returns `Err(NotInitialized)` if the governor has not yet been initialized.
     pub fn config(env: Env) -> Result<GovernorConfig, Error> {
         config::load(&env)
+    }
+
+    /// Current protocol fee recipient, without fetching the full config.
+    pub fn fee_recipient(env: Env) -> Result<Address, Error> {
+        Ok(config::load(&env)?.fee_recipient)
+    }
+
+    /// Current protocol fee in basis points, without fetching the full config.
+    pub fn fee_bps(env: Env) -> Result<u32, Error> {
+        Ok(config::load(&env)?.fee_bps)
     }
 
     /// Read-only: current minimum stream duration in seconds.
@@ -130,13 +144,12 @@ impl DripGovernor {
         role::has_role(&env, role, &account)
     }
 
-    /// Returns every account currently holding `role`.
+    /// Returns a page of accounts holding `role`, plus the total member count.
     ///
-    /// Enables on-chain role-membership auditing without replaying every
-    /// `grant_role`/`revoke_role` event from genesis. The index is maintained
-    /// automatically by `grant_role` and `revoke_role`.
-    pub fn role_members(env: Env, role: Role) -> Vec<Address> {
-        role::role_members(&env, role)
+    /// The page is capped at 100 accounts. The index is maintained by the
+    /// single-account and batch role mutation methods.
+    pub fn role_members(env: Env, role: Role, offset: u32, limit: u32) -> RoleMembersPage {
+        role::role_members(&env, role, offset, limit)
     }
 
     /// Current maximum stream duration in seconds, without fetching the full
@@ -264,6 +277,21 @@ impl DripGovernor {
 
     // ── Role administration (Admin-gated) ────────────────────────────────
 
+    /// Grants `role` to `account` with an optional expiration timestamp (Issue #692). Only an `Admin` may call this.
+    pub fn grant_role_with_expiration(
+        env: Env,
+        caller: Address,
+        role: Role,
+        account: Address,
+        expires_at: Option<u64>,
+    ) -> Result<(), Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        if role::grant_with_expiration(&env, role, &account, expires_at) {
+            events::grant_role(&env, &caller, role, &account);
+        }
+        Ok(())
+    }
+
     /// Grants `role` to `account`. Only an `Admin` may call this.
     pub fn grant_role(
         env: Env,
@@ -293,6 +321,45 @@ impl DripGovernor {
         role::require_role(&env, &caller, Role::Admin)?;
         if role::revoke(&env, role, &account)? {
             events::revoke_role(&env, &caller, role, &account);
+        }
+        Ok(())
+    }
+
+    /// Grants `role` to each account. Only an `Admin` may call this.
+    ///
+    /// Emits the same per-account event as `grant_role`, only for new grants.
+    pub fn grant_role_batch(
+        env: Env,
+        caller: Address,
+        role: Role,
+        accounts: Vec<Address>,
+    ) -> Result<(), Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        for index in 0..accounts.len() {
+            let account = accounts.get(index).unwrap();
+            if role::grant(&env, role, &account) {
+                events::grant_role(&env, &caller, role, &account);
+            }
+        }
+        Ok(())
+    }
+
+    /// Revokes `role` from each account. Only an `Admin` may call this.
+    ///
+    /// Preserves `revoke_role` idempotency and last-admin protection, and
+    /// emits one event for each account whose role was actually removed.
+    pub fn revoke_role_batch(
+        env: Env,
+        caller: Address,
+        role: Role,
+        accounts: Vec<Address>,
+    ) -> Result<(), Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        for index in 0..accounts.len() {
+            let account = accounts.get(index).unwrap();
+            if role::revoke(&env, role, &account)? {
+                events::revoke_role(&env, &caller, role, &account);
+            }
         }
         Ok(())
     }
@@ -353,6 +420,19 @@ impl DripGovernor {
         Ok(())
     }
 
+    /// Cancels the pending authority transfer. Only an `Admin` may call this.
+    pub fn revoke_propose_authority(env: Env, caller: Address) -> Result<(), Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        let storage = env.storage().instance();
+        let pending: Address = storage
+            .get(&DataKey::PendingAuthority)
+            .ok_or(Error::NoPendingAuthority)?;
+        storage.remove(&DataKey::PendingAuthority);
+        storage.remove(&DataKey::PendingAuthorityProposer);
+        events::revoke_propose_authority(&env, &caller, &pending);
+        Ok(())
+    }
+
     /// Accept the pending authority transfer (step 2 of 2).
     ///
     /// Must be called by the pending authority address itself. This completes
@@ -388,6 +468,26 @@ impl DripGovernor {
 
         events::accept_authority(&env, &caller, &proposer);
         Ok(())
+    }
+
+    /// Propose a new admin address via two-step ownership transfer (Issue #682).
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+        role::propose_admin(&env, &caller, &new_admin)
+    }
+
+    /// Claim the pending admin role (step 2 of 2) (Issue #682).
+    pub fn claim_admin(env: Env, caller: Address) -> Result<(), Error> {
+        role::claim_admin(&env, &caller)
+    }
+
+    /// Returns the currently pending admin address, if any (Issue #682).
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        role::pending_admin(&env)
+    }
+
+    /// Revoke the currently pending admin proposal (Issue #682).
+    pub fn revoke_propose_admin(env: Env, caller: Address) -> Result<(), Error> {
+        role::revoke_propose_admin(&env, &caller)
     }
 
     /// Return the current number of `Admin` role holders.
@@ -571,6 +671,338 @@ impl DripGovernor {
             .instance()
             .set(&DataKey::ForceCancelPauseSecs, &seconds);
         events::set_force_cancel_pause_threshold(&env, &caller, seconds);
+        Ok(())
+    }
+
+    /// Sets the minimum quorum threshold in basis points (10,000 = 100%).
+    ///
+    /// Only an `Admin` may call this.
+    pub fn set_min_quorum_bps(env: Env, caller: Address, min_quorum_bps: u32) -> Result<(), Error> {
+        if min_quorum_bps > 10_000 {
+            return Err(Error::InvalidParam);
+        }
+        assert_not_paused(&env)?;
+        role::require_role_or_admin(&env, &caller, Role::Admin)?;
+        let old_min_quorum_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinQuorumBps)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinQuorumBps, &min_quorum_bps);
+        events::set_min_quorum_bps(&env, &caller, old_min_quorum_bps, min_quorum_bps);
+        Ok(())
+    }
+
+    /// Read-only: current minimum quorum in basis points.
+    pub fn min_quorum_bps(env: Env) -> Result<u32, Error> {
+        Ok(config::load(&env)?.min_quorum_bps)
+    }
+
+    /// Sets the total governance supply used for quorum calculations.
+    ///
+    /// Only an `Admin` may call this.
+    pub fn set_governance_supply(env: Env, caller: Address, supply: u64) -> Result<(), Error> {
+        if supply == 0 {
+            return Err(Error::InvalidParam);
+        }
+        assert_not_paused(&env)?;
+        role::require_role_or_admin(&env, &caller, Role::Admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceSupply, &supply);
+        Ok(())
+    }
+
+    /// Read-only: current governance supply (defaults to admin_count if not explicitly set).
+    pub fn governance_supply(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovernanceSupply)
+            .unwrap_or_else(|| {
+                let admin_count: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AdminCount)
+                    .unwrap_or(1);
+                admin_count as u64
+            })
+    }
+
+    // ── Proposals (Admin-gated) ──────────────────────────────────────────────
+
+    /// Record a token balance / voting weight checkpoint for `voter` at the current ledger.
+    ///
+    /// Only an `Admin` may record governance token checkpoints. Checkpoints anchor
+    /// voting weights to the proposal's `snapshot_ledger` so transferring tokens to
+    /// a second wallet after proposal creation cannot be used to double-vote.
+    pub fn checkpoint_balance(
+        env: Env,
+        caller: Address,
+        voter: Address,
+        weight: u64,
+    ) -> Result<(), Error> {
+        role::require_role_or_admin(&env, &caller, Role::Admin)?;
+        ttl::bump(&env);
+        storage::record_checkpoint(&env, &voter, weight);
+        Ok(())
+    }
+
+    /// Read-only: returns the checkpointed voting weight for `account` at `ledger_sequence`.
+    pub fn get_prior_votes(env: Env, account: Address, ledger_sequence: u32) -> u64 {
+        storage::get_checkpoint_weight(&env, &account, ledger_sequence).unwrap_or(0)
+    }
+
+    /// Read-only: returns the proposal's snapshot ledger sequence.
+    pub fn proposal_snapshot_ledger(env: Env, proposal_id: u64) -> Result<u32, Error> {
+        storage::get_proposal_snapshot_ledger(&env, proposal_id).ok_or(Error::ProposalNotFound)
+    }
+
+    /// Read-only: returns the proposal's vote tally snapshot anchored at its snapshot ledger.
+    pub fn get_proposal_snapshot(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<storage::VoteTallySnapshot, Error> {
+        storage::get_vote_tally_snapshot(&env, proposal_id).ok_or(Error::ProposalNotFound)
+    }
+
+    /// Create a new governance proposal.
+    ///
+    /// Only an `Admin` may create proposals. The proposal has an execution
+    /// window (in seconds) within which it must be executed after passing.
+    /// If not executed within the window, the proposal expires.
+    pub fn propose(env: Env, caller: Address, execution_window_secs: u64) -> Result<u64, Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        if execution_window_secs == 0 {
+            return Err(Error::InvalidParam);
+        }
+        ttl::bump(&env);
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCounter)
+            .unwrap_or(0);
+        let proposal_id = counter + 1;
+        let snapshot_ledger = env.ledger().sequence();
+        let total_supply = Self::governance_supply(env.clone());
+
+        let proposal = storage::Proposal {
+            author: caller.clone(),
+            created_at: env.ledger().timestamp(),
+            snapshot_ledger,
+            execution_window_secs,
+            status: storage::ProposalStatus::Pending,
+            for_votes: 0,
+            against_votes: 0,
+        };
+
+        let snapshot = storage::VoteTallySnapshot {
+            proposal_id,
+            snapshot_ledger,
+            for_votes: 0,
+            against_votes: 0,
+            total_supply,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCounter, &proposal_id);
+        storage::add_proposal_to_status_index(&env, proposal_id, storage::ProposalStatus::Pending);
+        storage::set_proposal_snapshot_ledger(&env, proposal_id, snapshot_ledger);
+        storage::save_vote_tally_snapshot(&env, &snapshot);
+
+        Ok(proposal_id)
+    }
+
+    /// Read-only: every proposal currently in `status` (Issue #848).
+    ///
+    /// Backed by the `DataKey::ProposalsByStatus` index maintained on every
+    /// status transition, so voting portals can paginate one status without
+    /// loading every proposal entry.
+    pub fn proposals_by_status(env: Env, status: ProposalStatus) -> Vec<u64> {
+        storage::proposals_by_status(&env, status)
+    }
+
+    /// Execute a proposal that has passed voting.
+    ///
+    /// Fails with `ProposalExpired` if the execution window has elapsed.
+    /// Fails with `ProposalNotPending` if the proposal has been executed or cancelled.
+    /// Minimum delay (7 days) required between proposal creation and execution (Issue #688).
+    pub const MIN_EXECUTION_DELAY: u64 = 604_800;
+
+    /// Read-only: get minimum timelock delay for proposals in seconds.
+    pub fn min_execution_delay(_env: Env) -> u64 {
+        Self::MIN_EXECUTION_DELAY
+    }
+
+    /// Read-only: get a proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)
+    }
+
+    /// Execute a proposal that has passed voting.
+    ///
+    /// Fails with `TimelockNotMet` if the proposal has not elapsed MIN_EXECUTION_DELAY.
+    /// Fails with `ProposalExpired` if the execution window has elapsed.
+    /// Fails with `ProposalNotPending` if the proposal has been executed or cancelled.
+    /// Fails with `QuorumNotMet` if total votes (for_votes + against_votes) do not reach minimum quorum.
+    pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
+        ttl::bump(&env);
+
+        let proposal: storage::Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.status != storage::ProposalStatus::Pending
+            && proposal.status != storage::ProposalStatus::Active
+        {
+            return Err(Error::ProposalNotPending);
+        }
+
+        let elapsed = env.ledger().timestamp().saturating_sub(proposal.created_at);
+        if elapsed < Self::MIN_EXECUTION_DELAY {
+            return Err(Error::TimelockNotMet);
+        }
+        if elapsed
+            > proposal
+                .execution_window_secs
+                .saturating_add(Self::MIN_EXECUTION_DELAY)
+        {
+            return Err(Error::ProposalExpired);
+        }
+
+        let min_quorum_bps = config::load(&env)?.min_quorum_bps;
+        if min_quorum_bps > 0 {
+            let total_supply: u64 = storage::get_vote_tally_snapshot(&env, proposal_id)
+                .map(|s| s.total_supply)
+                .unwrap_or_else(|| Self::governance_supply(env.clone()));
+            let quorum_threshold = (total_supply as u128 * min_quorum_bps as u128 / 10_000) as u64;
+            let total_votes = proposal.for_votes.saturating_add(proposal.against_votes);
+            if total_votes < quorum_threshold {
+                return Err(Error::QuorumNotMet);
+            }
+        }
+
+        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Executed);
+
+        Ok(())
+    }
+
+    /// Cancel a proposal before it is executed.
+    ///
+    /// Only the proposal author may cancel, whether the proposal is still
+    /// pending or already active. Fails with `ProposalNotPending` if it has
+    /// already been executed or cancelled.
+    pub fn cancel_proposal(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
+        ttl::bump(&env);
+
+        let proposal: storage::Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if caller != proposal.author {
+            return Err(Error::NotAuthorized);
+        }
+
+        if proposal.status != storage::ProposalStatus::Pending
+            && proposal.status != storage::ProposalStatus::Active
+        {
+            return Err(Error::ProposalNotPending);
+        }
+
+        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Cancelled);
+
+        Ok(())
+    }
+
+    /// Cast a vote on a proposal (Issue #718).
+    pub fn cast_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<(), Error> {
+        Self::cast_vote_with_rationale(env, voter, proposal_id, support, None)
+    }
+
+    /// Cast a vote on a proposal with an explanation / IPFS CID rationale (Issue #718).
+    pub fn cast_vote_with_rationale(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+        rationale: Option<String>,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+        ttl::bump(&env);
+
+        if storage::has_voted(&env, proposal_id, &voter) {
+            return Err(Error::AlreadyVoted);
+        }
+
+        let mut proposal: storage::Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.status != storage::ProposalStatus::Pending
+            && proposal.status != storage::ProposalStatus::Active
+        {
+            return Err(Error::ProposalNotPending);
+        }
+
+        let elapsed = env.ledger().timestamp().saturating_sub(proposal.created_at);
+        if elapsed
+            > proposal
+                .execution_window_secs
+                .saturating_add(Self::MIN_EXECUTION_DELAY)
+        {
+            return Err(Error::ProposalExpired);
+        }
+
+        let weight = match storage::get_checkpoint_weight(&env, &voter, proposal.snapshot_ledger) {
+            Some(0) => return Err(Error::InsufficientVotingWeight),
+            Some(w) => w,
+            None => 1,
+        };
+
+        if support {
+            proposal.for_votes = proposal.for_votes.saturating_add(weight);
+        } else {
+            proposal.against_votes = proposal.against_votes.saturating_add(weight);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Active);
+
+        let snapshot = storage::VoteTallySnapshot {
+            proposal_id,
+            snapshot_ledger: proposal.snapshot_ledger,
+            for_votes: proposal.for_votes,
+            against_votes: proposal.against_votes,
+            total_supply: storage::get_vote_tally_snapshot(&env, proposal_id)
+                .map(|s| s.total_supply)
+                .unwrap_or_else(|| Self::governance_supply(env.clone())),
+        };
+        storage::save_vote_tally_snapshot(&env, &snapshot);
+        storage::record_voter_receipt(&env, proposal_id, &voter, weight);
+
+        events::vote_cast(&env, &voter, proposal_id, support, rationale);
         Ok(())
     }
 }

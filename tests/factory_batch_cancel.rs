@@ -60,6 +60,8 @@ mod factory_batch_cancel {
             &(now + duration),
             &false,
             &2_592_000_u64,
+            &false,
+            &None,
         );
 
         (stream_id, token_addr)
@@ -140,5 +142,37 @@ mod factory_batch_cancel {
             result.is_err(),
             "Second cancel should fail with StreamCancelled"
         );
+    }
+
+    #[test]
+    fn factory_cancel_batch_streams_deduplicates_addresses() {
+        use drip_factory::{DripFactory, DripFactoryClient, Error as FactoryError};
+
+        let env = base_env();
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (stream1, _) = deploy_stream(&env, &sender, &recipient, 1_000, 3_600);
+        let (stream2, _) = deploy_stream(&env, &sender, &recipient, 1_000, 3_600);
+
+        let factory_id = env.register_contract(None, DripFactory);
+        let factory = DripFactoryClient::new(&env, &factory_id);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+        factory.initialize(&dummy_hash, &Address::generate(&env));
+
+        let mut list = Vec::new(&env);
+        list.push_back(stream1.clone());
+        list.push_back(stream2.clone());
+        list.push_back(stream1.clone()); // duplicate of stream1
+        list.push_back(stream2.clone()); // duplicate of stream2
+
+        // The current contract rejects duplicate addresses atomically rather
+        // than silently deduplicating (see `DuplicateStreamId`, Issue #787).
+        let res = factory.try_cancel_batch_streams(&sender, &list);
+        assert_eq!(res, Err(Ok(FactoryError::DuplicateStreamId)));
+
+        // Atomic failure: neither stream was cancelled.
+        assert!(!DripStreamClient::new(&env, &stream1).info().is_cancelled());
+        assert!(!DripStreamClient::new(&env, &stream2).info().is_cancelled());
     }
 }

@@ -4,26 +4,20 @@
 
 pub mod pause;
 pub mod rbac;
+#[cfg(any(test, feature = "testutils"))]
+pub mod testutils;
 pub mod ttl;
 
-use soroban_sdk::{
-    xdr::{AccountId, Hash, PublicKey, ScAddress, Uint256},
-    Address, Env, TryFromVal,
+pub use ttl::{
+    bump_instance_ttl, bump_persistent_ttl, bump_persistent_with_reward,
+    configure_keeper_reward_pool, ensure_active_ttl, fund_keeper_reward_pool, keeper_reward_pool,
+    KeeperRewardError, KeeperRewardPool, TtlConfig, DEFAULT_KEEPER_REWARD_PER_KEY,
+    EXTEND_TTL_LEDGERS, MAINNET_EXTEND_TTL_LEDGERS, MAINNET_MIN_TTL_LEDGERS, MAINNET_TTL_CONFIG,
+    MIN_TTL_LEDGERS, TESTNET_EXTEND_TTL_LEDGERS, TESTNET_MIN_TTL_LEDGERS, TESTNET_TTL_CONFIG,
+    TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
-/// TTL threshold for instance storage extension.
-/// When the remaining TTL falls below this value, extend to `TTL_EXTEND_TO`.
-/// 100,000 ledgers × ~5s/ledger ≈ 5.8 days. This threshold is checked on every
-/// state-mutating call to prevent contract archival. Keeps streams active as long
-/// as they are being used; idle streams can still expire.
-pub const TTL_THRESHOLD: u32 = 100_000;
-
-/// Target TTL for instance storage extension.
-/// Extended to this value when `TTL_THRESHOLD` is reached.
-/// 200,000 ledgers × ~5s/ledger ≈ 11.6 days. Provides ~5.8 day safety margin
-/// after threshold is hit, ensuring a state-mutating call happens within that window
-/// before reaching Soroban's hard limits (e.g., stream::ttl::MAX_PAUSE_SECS).
-pub const TTL_EXTEND_TO: u32 = 200_000;
+use soroban_sdk::{Address, Env};
 
 /// Returns true when `address` is a known zero/degenerate address.
 ///
@@ -42,19 +36,18 @@ pub const TTL_EXTEND_TO: u32 = 200_000;
 /// directly, avoiding repeated StrKey string decoding. Address handles are
 /// tied to an `Env`, so they cannot be cached globally across invocations.
 pub fn is_zero_address(env: &Env, address: &Address) -> bool {
-    let zero_account = Address::try_from_val(
+    let zero_account = Address::from_string(&soroban_sdk::String::from_str(
         env,
-        &ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            [0u8; 32],
-        )))),
-    )
-    .unwrap();
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
     if address == &zero_account {
         return true;
     }
 
-    let zero_contract =
-        Address::try_from_val(env, &ScAddress::Contract(Hash([0u8; 32]))).unwrap();
+    let zero_contract = Address::from_string(&soroban_sdk::String::from_str(
+        env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    ));
 
     address == &zero_contract
 }

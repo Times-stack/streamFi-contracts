@@ -30,6 +30,26 @@ pub enum DataKey {
     /// The current owner who proposed the transfer.
     /// Used to hand ownership over when the pending owner accepts.
     PendingOwnerProposer,
+    /// Ledger timestamp when the pending owner was proposed.
+    PendingOwnerProposedAt,
+    /// Validity period for pending owner proposals, in seconds.
+    OwnerProposalTtl,
+    /// Persistent storage: balance of a specific token held for a specific account (Issue #724).
+    TokenAccountBalance(Address, Address),
+    /// Persistent storage: optional maximum deposit limit per token (Issue #724).
+    TokenMaxLimit(Address),
+    /// Pending emergency migration to cold storage with a timelock (Issue #679).
+    EmergencyMigration,
+    /// Transient reentrancy guard lock flag for external token transfers.
+    ReentrancyLock,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyMigration {
+    pub destination: Address,
+    pub proposed_at: u64,
+    pub executable_at: u64,
 }
 
 pub fn set_owner(env: &Env, a: &Address) {
@@ -98,7 +118,7 @@ pub fn get_operator_withdraw_limit(env: &Env) -> Option<i128> {
 }
 
 pub fn set_paused(env: &Env, paused: bool) {
-    drip_common::pause::set_paused(env, &DataKey::Paused, paused);
+    let _ = drip_common::pause::set_paused(env, &DataKey::Paused, paused);
 }
 
 pub fn is_paused(env: &Env) -> bool {
@@ -131,4 +151,76 @@ pub fn remove_pending_owner_proposer(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::PendingOwnerProposer);
+}
+
+pub fn set_pending_owner_proposed_at(env: &Env, timestamp: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingOwnerProposedAt, &timestamp);
+}
+
+pub fn get_pending_owner_proposed_at(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingOwnerProposedAt)
+}
+
+pub fn remove_pending_owner_proposed_at(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingOwnerProposedAt);
+}
+
+pub fn set_owner_proposal_ttl(env: &Env, ttl_seconds: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::OwnerProposalTtl, &ttl_seconds);
+}
+
+pub fn get_owner_proposal_ttl(env: &Env) -> Option<u64> {
+    env.storage().instance().get(&DataKey::OwnerProposalTtl)
+}
+
+pub fn get_token_account_balance(env: &Env, token: &Address, account: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TokenAccountBalance(
+            token.clone(),
+            account.clone(),
+        ))
+        .unwrap_or(0)
+}
+
+pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, balance: i128) {
+    let key = DataKey::TokenAccountBalance(token.clone(), account.clone());
+    env.storage().persistent().set(&key, &balance);
+    drip_common::ttl::bump_persistent(env, &key);
+}
+
+pub fn get_token_max_limit(env: &Env, token: &Address) -> Option<i128> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TokenMaxLimit(token.clone()))
+}
+
+pub fn set_token_max_limit(env: &Env, token: &Address, limit: &i128) {
+    let key = DataKey::TokenMaxLimit(token.clone());
+    env.storage().persistent().set(&key, limit);
+    drip_common::ttl::bump_persistent(env, &key);
+}
+
+pub fn set_emergency_migration(env: &Env, m: &EmergencyMigration) {
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyMigration, m);
+}
+
+pub fn get_emergency_migration(env: &Env) -> Option<EmergencyMigration> {
+    env.storage().instance().get(&DataKey::EmergencyMigration)
+}
+
+pub fn remove_emergency_migration(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::EmergencyMigration);
 }

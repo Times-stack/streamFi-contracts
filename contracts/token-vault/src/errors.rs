@@ -31,4 +31,16 @@ pub enum Error {
     WithdrawTransferFailed = 14,
     /// The WASM hash provided to `upgrade` is all zeros (invalid).
     InvalidWasmHash = 15,
+    /// `accept_owner` was called after the ownership proposal expired.
+    PendingOwnerExpired = 16,
+    /// Target token does not comply with the standard SEP-0041 interface (Issue #696).
+    InvalidToken = 17,
+    /// Timelock has not expired yet for emergency migration (Issue #679).
+    TimelockNotExpired = 18,
+    /// No emergency migration has been proposed (Issue #679).
+    NoMigrationProposed = 19,
+    /// Reentrant invocation detected during an active external token transfer.
+    ReentrancyDetected = 20,
+    /// A single deposit exceeded `MAX_VAULT_DEPOSIT`.
+    DepositExceedsMax = 21,
 }

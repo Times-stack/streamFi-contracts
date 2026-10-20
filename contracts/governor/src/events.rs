@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, Address, Env};
+use soroban_sdk::{symbol_short, Address, Env, Symbol};
 
 use crate::Role;
 
@@ -69,6 +69,17 @@ pub fn propose_authority(env: &Env, caller: &Address, new_authority: &Address) {
     env.events().publish(
         (symbol_short!("propose"), caller.clone()),
         new_authority.clone(),
+    );
+}
+
+/// Emitted when an `Admin` cancels a pending authority proposal.
+pub fn revoke_propose_authority(env: &Env, caller: &Address, pending_authority: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "authority_proposal_revoked"),
+            caller.clone(),
+        ),
+        pending_authority.clone(),
     );
 }
 
@@ -156,4 +167,40 @@ pub fn factory_unpaused(env: &Env, caller: &Address, resumed_at: u64) {
 pub fn upgraded(env: &Env, caller: &Address, upgraded_at: u64) {
     env.events()
         .publish((symbol_short!("upgraded"), caller.clone()), upgraded_at);
+}
+
+/// Emitted when a vote is cast on a proposal with an optional rationale/IPFS CID string (Issue #718).
+pub fn vote_cast(
+    env: &Env,
+    voter: &Address,
+    proposal_id: u64,
+    support: bool,
+    rationale: Option<soroban_sdk::String>,
+) {
+    env.events().publish(
+        (symbol_short!("vote"), voter.clone(), proposal_id),
+        (support, rationale),
+    );
+}
+
+pub fn set_min_quorum_bps(
+    env: &Env,
+    caller: &Address,
+    old_min_quorum_bps: u32,
+    new_min_quorum_bps: u32,
+) {
+    env.events().publish(
+        (symbol_short!("quorum"), caller.clone()),
+        (old_min_quorum_bps, new_min_quorum_bps),
+    );
+}
+
+/// Emitted when a proposal is queued for execution after passing quorum and vote threshold.
+/// Records the proposal ID and the execution window deadline (timestamp when execution becomes valid).
+#[allow(dead_code)]
+pub fn proposal_execution_queued(env: &Env, proposal_id: u64, execution_time: u64) {
+    env.events().publish(
+        (Symbol::new(env, "exec_queue"), proposal_id),
+        execution_time,
+    );
 }

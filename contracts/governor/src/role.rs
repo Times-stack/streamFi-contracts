@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Vec as SorobanVec};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use drip_common::rbac;
 
@@ -8,6 +8,16 @@ use crate::Error;
 
 /// Re-export so callers using `role::Role` continue to work unchanged.
 pub use crate::storage::Role;
+
+/// A page of role members, with the total count for pagination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleMembersPage {
+    pub members: Vec<Address>,
+    pub total: u32,
+}
+
+const MAX_ROLE_MEMBERS_PAGE_SIZE: u32 = 100;
 
 // ── Key helpers ────────────────────────────────────────────────────────────
 
@@ -41,6 +51,24 @@ pub fn has_role(env: &Env, role: Role, account: &Address) -> bool {
 #[allow(dead_code)]
 pub fn admin_count(env: &Env) -> u32 {
     rbac::admin_count(env, &DataKey::AdminCount)
+}
+
+/// Grants `role` to `account` with an optional expiration timestamp (Issue #692).
+pub fn grant_with_expiration(
+    env: &Env,
+    role: Role,
+    account: &Address,
+    expires_at: Option<u64>,
+) -> bool {
+    rbac::grant_with_expiration(
+        env,
+        &role_key(role, account),
+        &DataKey::AdminCount,
+        &members_key(role),
+        role == Role::Admin,
+        account,
+        expires_at,
+    )
 }
 
 /// Grants `role` to `account`.
@@ -87,12 +115,22 @@ pub fn require_role(env: &Env, caller: &Address, role: Role) -> Result<(), Error
         .map_err(|_| Error::NotAuthorized)
 }
 
-/// Returns every account currently holding `role`.
+/// Returns a page of accounts currently holding `role`.
 ///
 /// Reads from the `RoleMembers` index maintained by `grant`/`revoke`.
-/// Returns an empty vector if no accounts hold the role.
-pub fn role_members(env: &Env, role: Role) -> SorobanVec<Address> {
-    rbac::role_members(env, &members_key(role))
+/// The result is capped at 100 members and includes the total member count.
+pub fn role_members(env: &Env, role: Role, offset: u32, limit: u32) -> RoleMembersPage {
+    let all_members = rbac::role_members(env, &members_key(role));
+    let total = all_members.len();
+    let start = offset.min(total);
+    let end = start
+        .saturating_add(limit.min(MAX_ROLE_MEMBERS_PAGE_SIZE))
+        .min(total);
+    let mut members = Vec::new(env);
+    for index in start..end {
+        members.push_back(all_members.get(index).unwrap());
+    }
+    RoleMembersPage { members, total }
 }
 
 /// Requires that `caller` authorized the transaction and holds `role` **or**
@@ -110,4 +148,78 @@ pub fn require_role_or_admin(env: &Env, caller: &Address, role: Role) -> Result<
         Some(ttl::bump),
     )
     .map_err(|_| Error::NotAuthorized)
+}
+
+/// Require that `caller` authorized the transaction and holds `Pauser` **or** `Admin` role.
+/// Emergency responders (pausers) can execute pause/unpause operations (Issue #771).
+/// This separates regular parameter tuning from emergency pause authority.
+///
+/// Bumps instance TTL on success.
+pub fn require_emergency_responder(env: &Env, caller: &Address) -> Result<(), Error> {
+    require_role_or_admin(env, caller, Role::Pauser)
+}
+
+/// Propose transferring the admin role to a new address (step 1 of 2) (Issue #682).
+pub fn propose_admin(env: &Env, proposer: &Address, new_admin: &Address) -> Result<(), Error> {
+    require_role(env, proposer, Role::Admin)?;
+    if has_role(env, Role::Admin, new_admin) {
+        return Err(Error::InvalidParam);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAuthority, new_admin);
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAuthorityProposer, proposer);
+    crate::events::propose_authority(env, proposer, new_admin);
+    Ok(())
+}
+
+/// Claim proposed admin role (step 2 of 2) (Issue #682).
+pub fn claim_admin(env: &Env, claimer: &Address) -> Result<(), Error> {
+    let pending: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::PendingAuthority)
+        .ok_or(Error::NoPendingAuthority)?;
+    if *claimer != pending {
+        return Err(Error::NotPendingAuthority);
+    }
+    claimer.require_auth();
+    ttl::bump(env);
+
+    let proposer: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::PendingAuthorityProposer)
+        .ok_or(Error::NoPendingAuthority)?;
+
+    grant(env, Role::Admin, claimer);
+    let _ = revoke(env, Role::Admin, &proposer)?;
+
+    env.storage().instance().remove(&DataKey::PendingAuthority);
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingAuthorityProposer);
+
+    crate::events::accept_authority(env, claimer, &proposer);
+    Ok(())
+}
+
+/// Returns the pending proposed admin address, if any (Issue #682).
+pub fn pending_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingAuthority)
+}
+
+/// Revokes the currently pending admin proposal.
+pub fn revoke_propose_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+    require_role(env, caller, Role::Admin)?;
+    let storage = env.storage().instance();
+    let pending: Address = storage
+        .get(&DataKey::PendingAuthority)
+        .ok_or(Error::NoPendingAuthority)?;
+    storage.remove(&DataKey::PendingAuthority);
+    storage.remove(&DataKey::PendingAuthorityProposer);
+    crate::events::revoke_propose_authority(env, caller, &pending);
+    Ok(())
 }

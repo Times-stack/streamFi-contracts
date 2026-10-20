@@ -7,19 +7,88 @@ mod storage;
 mod tests;
 mod ttl;
 
-use drip_common::is_zero_address;
+use drip_common::{is_zero_address, TTL_EXTEND_TO};
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 use storage::{
-    get_max_limit, get_operator, get_operator_withdraw_limit, get_owner, get_pending_owner,
-    get_pending_owner_proposer, get_token, is_paused, remove_operator, remove_pending_owner,
-    remove_pending_owner_proposer, set_max_limit, set_operator, set_operator_withdraw_limit,
-    set_owner, set_paused, set_pending_owner, set_pending_owner_proposer, set_token, DataKey,
+    get_emergency_migration, get_max_limit, get_operator, get_operator_withdraw_limit, get_owner,
+    get_owner_proposal_ttl, get_pending_owner, get_pending_owner_proposed_at,
+    get_pending_owner_proposer, get_token, get_token_account_balance, get_token_max_limit,
+    is_paused, remove_emergency_migration, remove_operator, remove_pending_owner,
+    remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_emergency_migration,
+    set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
+    set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
+    set_pending_owner_proposed_at, set_pending_owner_proposer, set_token,
+    set_token_account_balance, set_token_max_limit, DataKey, EmergencyMigration,
 };
 use ttl::bump_instance;
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositSpec {
+    pub from: Address,
+    pub amount: i128,
+}
+
 #[contract]
 pub struct TokenVault;
+
+const OWNER_PROPOSAL_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+pub const EMERGENCY_MIGRATION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60;
+
+/// Maximum amount accepted by a single deposit (10^30 stroops).
+///
+/// Streaming math multiplies deposits by rates and durations; keeping every
+/// single deposit well below `i128::MAX` leaves headroom for those products
+/// instead of allowing them to overflow downstream.
+pub const MAX_VAULT_DEPOSIT: i128 = 1_000_000_000_000_000_000_000_000_000_000;
+
+/// Lightweight transient reentrancy guard macro protecting external token transfers.
+///
+/// Sets `DataKey::ReentrancyLock` in temporary storage before executing `$body`
+/// and clears it upon completion. Any reentrant invocation while the lock is
+/// active immediately returns `Err(Error::ReentrancyDetected)`.
+#[macro_export]
+macro_rules! non_reentrant {
+    ($env:expr, $body:block) => {{
+        if $env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&$crate::storage::DataKey::ReentrancyLock)
+            .unwrap_or(false)
+        {
+            return Err($crate::errors::Error::ReentrancyDetected);
+        }
+        $env.storage()
+            .temporary()
+            .set(&$crate::storage::DataKey::ReentrancyLock, &true);
+        let result = (|| -> Result<_, $crate::errors::Error> { $body })();
+        $env.storage()
+            .temporary()
+            .remove(&$crate::storage::DataKey::ReentrancyLock);
+        result
+    }};
+}
+
+/// Alias for [`non_reentrant!`].
+#[macro_export]
+macro_rules! reentrancy_guard {
+    ($env:expr, $body:block) => {
+        $crate::non_reentrant!($env, $body)
+    };
+}
+
+/// Pre-flight validation verifying that `token` adheres to standard SEP-0041
+/// Soroban token interface (non-zero address, contract target, balance read probe) (Issue #696).
+pub fn validate_sep41_token(env: &Env, token: &Address) -> Result<(), Error> {
+    if is_zero_address(env, token) {
+        return Err(Error::InvalidToken);
+    }
+    let client = token::Client::new(env, token);
+    // Probe balance method to verify contract implements SEP-41 balance signature
+    let _ = client.balance(&env.current_contract_address());
+    Ok(())
+}
 
 fn token_client(env: &Env) -> Result<token::Client<'_>, Error> {
     let token_addr = get_token(env).ok_or(Error::NotInitialized)?;
@@ -70,6 +139,62 @@ fn assert_not_paused(env: &Env) -> Result<(), Error> {
     drip_common::pause::require_not_paused(env, &DataKey::Paused).map_err(|_| Error::ContractPaused)
 }
 
+fn withdraw_payouts(
+    env: &Env,
+    caller: &Address,
+    payouts: &Vec<(Address, i128)>,
+) -> Result<(), Error> {
+    non_reentrant!(env, {
+        assert_not_paused(env)?;
+        let owner = get_owner(env).ok_or(Error::NotInitialized)?;
+        require_owner_or_operator(env, caller, &owner)?;
+
+        if payouts.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+
+        let token = get_token(env).ok_or(Error::NotInitialized)?;
+        validate_sep41_token(env, &token)?;
+
+        let mut total = 0_i128;
+        for index in 0..payouts.len() {
+            let (_, amount) = payouts.get(index).ok_or(Error::InvalidAmount)?;
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            total = total.checked_add(amount).ok_or(Error::ArithmeticOverflow)?;
+        }
+
+        if total > withdraw_cap(env, caller, &owner)? {
+            return Err(Error::LimitExceeded);
+        }
+
+        let balance = vault_balance(env)?;
+        if total > balance {
+            return Err(Error::LimitExceeded);
+        }
+
+        let tk = token_client(env)?;
+        let mut expected_balance = balance;
+        let by_operator = caller != &owner;
+        for index in 0..payouts.len() {
+            let (to, amount) = payouts.get(index).ok_or(Error::InvalidAmount)?;
+            expected_balance = expected_balance
+                .checked_sub(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            tk.transfer(&env.current_contract_address(), &to, &amount);
+            let new_balance = vault_balance(env)?;
+            if new_balance != expected_balance {
+                return Err(Error::WithdrawTransferFailed);
+            }
+            events::withdrawn(env, caller, &to, amount, new_balance, by_operator);
+        }
+
+        bump_instance(env);
+        Ok(())
+    })
+}
+
 #[contractimpl]
 impl TokenVault {
     /// Initialise the vault.
@@ -96,6 +221,7 @@ impl TokenVault {
         if max_limit <= 0 {
             return Err(Error::InvalidAmount);
         }
+        validate_sep41_token(&env, &token)?;
 
         if get_owner(&env).is_some() {
             return Err(Error::AlreadyInitialized);
@@ -105,79 +231,153 @@ impl TokenVault {
         set_owner(&env, &owner);
         set_token(&env, &token);
         set_max_limit(&env, &max_limit);
+        store_owner_proposal_ttl(&env, OWNER_PROPOSAL_TTL_SECONDS);
 
         events::initialized(&env, &owner, &token, max_limit);
         Ok(())
     }
 
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
-        assert_not_paused(&env)?;
-        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
-        require_owner_or_operator(&env, &from, &owner)?;
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            require_owner_or_operator(&env, &from, &owner)?;
 
-        if amount <= 0 {
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            if amount > MAX_VAULT_DEPOSIT {
+                return Err(Error::DepositExceedsMax);
+            }
+
+            let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            let balance = vault_balance(&env)?;
+            let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
+
+            let expected_balance = balance
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if expected_balance > max {
+                return Err(Error::LimitExceeded);
+            }
+
+            let tk = token_client(&env)?;
+            tk.transfer(&from, &env.current_contract_address(), &amount);
+            let new_balance = tk.balance(&env.current_contract_address());
+            if new_balance > max {
+                return Err(Error::LimitExceeded);
+            }
+            if new_balance != expected_balance {
+                return Err(Error::DepositTransferFailed);
+            }
+
+            let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            let cur_acc_bal = get_token_account_balance(&env, &default_token, &from);
+            if let Some(new_acc_bal) = cur_acc_bal.checked_add(amount) {
+                set_token_account_balance(&env, &default_token, &from, new_acc_bal);
+            }
+
+            bump_instance(&env);
+            events::deposited(&env, &from, amount, new_balance);
+            Ok(())
+        })
+    }
+
+    /// Deposits tokens with an explicit fee breakdown for financial accounting (Issue #687).
+    ///
+    /// Deducts `fee_amount` from `gross_amount` and escrows the remaining `net_amount` in the vault.
+    /// Emits `TokenDeposited` event containing `DepositEvent { gross_amount, fee_amount, net_amount }`.
+    pub fn deposit_with_fee(
+        env: Env,
+        from: Address,
+        gross_amount: i128,
+        fee_amount: i128,
+    ) -> Result<(), Error> {
+        if fee_amount < 0 || gross_amount <= 0 || fee_amount >= gross_amount {
             return Err(Error::InvalidAmount);
         }
-
-        let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
-        let balance = vault_balance(&env)?;
-        let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
-
-        let expected_balance = balance
-            .checked_add(amount)
+        if gross_amount > MAX_VAULT_DEPOSIT {
+            return Err(Error::DepositExceedsMax);
+        }
+        let net_amount = gross_amount
+            .checked_sub(fee_amount)
             .ok_or(Error::ArithmeticOverflow)?;
-        if expected_balance > max {
-            return Err(Error::LimitExceeded);
-        }
 
-        let tk = token_client(&env)?;
-        tk.transfer(&from, &env.current_contract_address(), &amount);
-        let new_balance = tk.balance(&env.current_contract_address());
-        if new_balance > max {
-            return Err(Error::LimitExceeded);
-        }
-        if new_balance != expected_balance {
-            return Err(Error::DepositTransferFailed);
-        }
-
-        bump_instance(&env);
-        events::deposited(&env, &from, amount, new_balance);
+        Self::deposit(env.clone(), from.clone(), net_amount)?;
+        events::token_deposited(&env, &from, gross_amount, fee_amount, net_amount);
         Ok(())
     }
 
+    /// Consolidates deposits from multiple accounts in a single transaction.
+    ///
+    /// Requires authorization from each depositor individually.
+    pub fn batch_deposit(env: Env, deposits: Vec<DepositSpec>) -> Result<(), Error> {
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            if deposits.is_empty() {
+                return Err(Error::InvalidAmount);
+            }
+            let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
+
+            let mut total_deposit: i128 = 0;
+            for deposit in deposits.iter() {
+                if deposit.amount <= 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                if deposit.amount > MAX_VAULT_DEPOSIT {
+                    return Err(Error::DepositExceedsMax);
+                }
+                deposit.from.require_auth();
+                total_deposit = total_deposit
+                    .checked_add(deposit.amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
+
+            let balance = vault_balance(&env)?;
+            let expected_balance = balance
+                .checked_add(total_deposit)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if expected_balance > max {
+                return Err(Error::LimitExceeded);
+            }
+
+            let tk = token_client(&env)?;
+            let contract_addr = env.current_contract_address();
+
+            for deposit in deposits.iter() {
+                tk.transfer(&deposit.from, &contract_addr, &deposit.amount);
+                let current_balance = tk.balance(&contract_addr);
+                events::deposited(&env, &deposit.from, deposit.amount, current_balance);
+            }
+
+            let final_balance = tk.balance(&contract_addr);
+            if final_balance > max {
+                return Err(Error::LimitExceeded);
+            }
+            if final_balance != expected_balance {
+                return Err(Error::DepositTransferFailed);
+            }
+
+            bump_instance(&env);
+            Ok(())
+        })
+    }
+
     pub fn withdraw(env: Env, caller: Address, to: Address, amount: i128) -> Result<(), Error> {
-        assert_not_paused(&env)?;
-        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
-        require_owner_or_operator(&env, &caller, &owner)?;
+        let mut payouts = Vec::new(&env);
+        payouts.push_back((to, amount));
+        withdraw_payouts(&env, &caller, &payouts)
+    }
 
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        let limit = withdraw_cap(&env, &caller, &owner)?;
-        if amount > limit {
-            return Err(Error::LimitExceeded);
-        }
-
-        let balance = vault_balance(&env)?;
-        let expected_balance = balance
-            .checked_sub(amount)
-            .ok_or(Error::ArithmeticOverflow)?;
-
-        let tk = token_client(&env)?;
-        tk.transfer(&env.current_contract_address(), &to, &amount);
-        let new_balance = vault_balance(&env)?;
-        if new_balance != expected_balance {
-            return Err(Error::DepositTransferFailed);
-        }
-
-        // Record which signing role authorized the payout (issue #662): the
-        // ownership-transfer path above can change `owner`, so consumers of
-        // the event can't reliably infer role from the `caller` address.
-        let by_operator = caller != owner;
-        bump_instance(&env);
-        events::withdrawn(&env, &caller, &to, amount, new_balance, by_operator);
-        Ok(())
+    /// Atomically pay several recipients, enforcing the operator's limit
+    /// against the sum of all payouts before transferring any tokens.
+    pub fn withdraw_batch(
+        env: Env,
+        caller: Address,
+        payouts: Vec<(Address, i128)>,
+    ) -> Result<(), Error> {
+        withdraw_payouts(&env, &caller, &payouts)
     }
 
     /// Owner sets the per-call cap that bounds how much a delegated operator
@@ -306,6 +506,7 @@ impl TokenVault {
         bump_instance(&env);
         set_pending_owner(&env, &new_owner);
         set_pending_owner_proposer(&env, &caller);
+        set_pending_owner_proposed_at(&env, env.ledger().timestamp());
         events::owner_proposed(&env, &caller, &new_owner);
         Ok(())
     }
@@ -326,11 +527,20 @@ impl TokenVault {
             return Err(Error::NotPendingOwner);
         }
         caller.require_auth();
+        let proposed_at = get_pending_owner_proposed_at(&env).ok_or(Error::PendingOwnerExpired)?;
+        let proposal_ttl = get_owner_proposal_ttl(&env).unwrap_or(OWNER_PROPOSAL_TTL_SECONDS);
+        let expires_at = proposed_at
+            .checked_add(proposal_ttl)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if env.ledger().timestamp() >= expires_at {
+            return Err(Error::PendingOwnerExpired);
+        }
         let proposer = get_pending_owner_proposer(&env).ok_or(Error::NoPendingOwner)?;
         bump_instance(&env);
         set_owner(&env, &caller);
         remove_pending_owner(&env);
         remove_pending_owner_proposer(&env);
+        remove_pending_owner_proposed_at(&env);
         events::owner_accepted(&env, &caller, &proposer);
         Ok(())
     }
@@ -344,6 +554,17 @@ impl TokenVault {
     /// execute before the owner raises or removes the cap.
     pub fn operator_withdraw_limit(env: Env) -> Option<i128> {
         get_operator_withdraw_limit(&env)
+    }
+
+    /// Read-only: the token contract's current balance held by this vault.
+    /// Includes direct token transfers that bypass `deposit`.
+    pub fn balance(env: Env) -> Option<i128> {
+        vault_balance(&env).ok()
+    }
+
+    /// Read-only: the maximum token balance the vault accepts.
+    pub fn max_limit(env: Env) -> Option<i128> {
+        get_max_limit(&env)
     }
 
     /// Read-only: the maximum amount `caller` can withdraw at this moment.
@@ -376,13 +597,31 @@ impl TokenVault {
         get_pending_owner_proposer(&env)
     }
 
-    /// Read-only: the SEP-41 token address this vault holds.
-    ///
-    /// Allows external callers and contracts to verify which token a given vault
-    /// instance manages before routing deposits or displaying vault information.
-    /// Returns `None` if the vault has not been initialized.
-    pub fn token(env: Env) -> Option<Address> {
-        get_token(&env)
+    /// Read-only: how long a pending owner proposal remains valid, in seconds.
+    pub fn owner_proposal_ttl(env: Env) -> Option<u64> {
+        get_owner_proposal_ttl(&env)
+    }
+
+    /// Configure the validity period for pending and future owner proposals.
+    pub fn set_owner_proposal_ttl(
+        env: Env,
+        caller: Address,
+        ttl_seconds: u64,
+    ) -> Result<(), Error> {
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        if ttl_seconds == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let old_ttl = get_owner_proposal_ttl(&env).unwrap_or(OWNER_PROPOSAL_TTL_SECONDS);
+        bump_instance(&env);
+        store_owner_proposal_ttl(&env, ttl_seconds);
+        events::owner_proposal_ttl_set(&env, &caller, old_ttl, ttl_seconds);
+        Ok(())
     }
 
     // ── Emergency pause (owner-gated) ─────────────────────────────────────
@@ -474,5 +713,246 @@ impl TokenVault {
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         events::upgraded(&env, &caller, env.ledger().timestamp());
         Ok(())
+    }
+
+    // ── Multi-token vault support (Issue #724) ─────────────────────────────
+
+    /// Deposits an arbitrary token into the vault for a specific account (Issue #724).
+    pub fn deposit_token(
+        env: Env,
+        from: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            require_owner_or_operator(&env, &from, &owner)?;
+
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            if amount > MAX_VAULT_DEPOSIT {
+                return Err(Error::DepositExceedsMax);
+            }
+
+            if let Some(max) = get_token_max_limit(&env, &token) {
+                let tk_client = token::Client::new(&env, &token);
+                let current_vault_balance = tk_client.balance(&env.current_contract_address());
+                let expected_balance = current_vault_balance
+                    .checked_add(amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if expected_balance > max {
+                    return Err(Error::LimitExceeded);
+                }
+            }
+
+            let tk = token::Client::new(&env, &token);
+            tk.transfer(&from, &env.current_contract_address(), &amount);
+
+            let current_acc_balance = get_token_account_balance(&env, &token, &from);
+            let new_acc_balance = current_acc_balance
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            set_token_account_balance(&env, &token, &from, new_acc_balance);
+
+            bump_instance(&env);
+            events::deposited(
+                &env,
+                &from,
+                amount,
+                tk.balance(&env.current_contract_address()),
+            );
+            Ok(())
+        })
+    }
+
+    /// Withdraws a specific token from the vault to a destination address (Issue #724).
+    pub fn withdraw_token(
+        env: Env,
+        caller: Address,
+        token: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            require_owner_or_operator(&env, &caller, &owner)?;
+
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            let cap = withdraw_cap(&env, &caller, &owner)?;
+            if amount > cap {
+                return Err(Error::LimitExceeded);
+            }
+
+            let tk = token::Client::new(&env, &token);
+            let vault_bal = tk.balance(&env.current_contract_address());
+            if amount > vault_bal {
+                return Err(Error::LimitExceeded);
+            }
+
+            let current_acc_balance = get_token_account_balance(&env, &token, &caller);
+            if caller != owner && current_acc_balance < amount {
+                return Err(Error::LimitExceeded);
+            }
+
+            tk.transfer(&env.current_contract_address(), &to, &amount);
+
+            if current_acc_balance >= amount {
+                set_token_account_balance(&env, &token, &caller, current_acc_balance - amount);
+            }
+
+            let new_vault_bal = tk.balance(&env.current_contract_address());
+            let by_operator = caller != owner;
+            events::withdrawn(&env, &caller, &to, amount, new_vault_bal, by_operator);
+
+            bump_instance(&env);
+            Ok(())
+        })
+    }
+
+    /// Read-only: balance of a specific token held for an account in persistent storage (Issue #724).
+    pub fn get_token_account_balance(env: Env, token: Address, account: Address) -> i128 {
+        get_token_account_balance(&env, &token, &account)
+    }
+
+    /// Read-only: alias for get_token_account_balance (Issue #724).
+    pub fn balance_by_token(env: Env, token: Address, account: Address) -> i128 {
+        get_token_account_balance(&env, &token, &account)
+    }
+
+    /// Sets the maximum deposit limit for a specific token (Issue #724).
+    pub fn set_token_max_limit(
+        env: Env,
+        caller: Address,
+        token: Address,
+        limit: i128,
+    ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        require_owner_or_operator(&env, &caller, &owner)?;
+
+        if limit <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        set_token_max_limit(&env, &token, &limit);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Read-only: maximum deposit limit for a specific token, if set (Issue #724).
+    pub fn token_max_limit(env: Env, token: Address) -> Option<i128> {
+        get_token_max_limit(&env, &token)
+    }
+
+    /// Read-only: pre-flight check validating that target token adheres to standard SEP-0041 interface (Issue #696).
+    pub fn is_token_compliant(env: Env, token: Address) -> bool {
+        validate_sep41_token(&env, &token).is_ok()
+    }
+
+    // ── Emergency Migration to cold storage (Issue #679) ──────────────────
+
+    /// Initiates an emergency migration of the vault's assets to a cold storage destination (Issue #679).
+    ///
+    /// Requires owner/governor authorization. Enforces a 48-hour timelock before the migration
+    /// can be executed, giving stakeholders time to detect and respond to unauthorized attempts.
+    pub fn initiate_emergency_migration(
+        env: Env,
+        caller: Address,
+        destination: Address,
+    ) -> Result<(), Error> {
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        if is_zero_address(&env, &destination) {
+            return Err(Error::InvalidParam);
+        }
+
+        let now = env.ledger().timestamp();
+        let executable_at = now
+            .checked_add(EMERGENCY_MIGRATION_TIMELOCK_SECONDS)
+            .ok_or(Error::ArithmeticOverflow)?;
+
+        let migration = EmergencyMigration {
+            destination: destination.clone(),
+            proposed_at: now,
+            executable_at,
+        };
+
+        bump_instance(&env);
+        set_emergency_migration(&env, &migration);
+        events::emergency_migration_initiated(&env, &caller, &destination, executable_at);
+        Ok(())
+    }
+
+    /// Executes a pending emergency migration after the 48-hour timelock has elapsed (Issue #679).
+    ///
+    /// Transfers all vault token balance to the configured cold storage destination.
+    pub fn execute_emergency_migration(env: Env, caller: Address) -> Result<i128, Error> {
+        non_reentrant!(&env, {
+            let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            if caller != owner {
+                return Err(Error::NotAuthorized);
+            }
+            caller.require_auth();
+
+            let migration = get_emergency_migration(&env).ok_or(Error::NoMigrationProposed)?;
+            let now = env.ledger().timestamp();
+            if now < migration.executable_at {
+                return Err(Error::TimelockNotExpired);
+            }
+
+            let tk = token_client(&env)?;
+            let balance = tk.balance(&env.current_contract_address());
+            if balance > 0 {
+                tk.transfer(
+                    &env.current_contract_address(),
+                    &migration.destination,
+                    &balance,
+                );
+            }
+
+            remove_emergency_migration(&env);
+            bump_instance(&env);
+            events::emergency_migration_executed(&env, &caller, &migration.destination, balance);
+            Ok(balance)
+        })
+    }
+
+    /// Cancels a pending emergency migration before or after it becomes executable (Issue #679).
+    pub fn cancel_emergency_migration(env: Env, caller: Address) -> Result<(), Error> {
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        let _ = get_emergency_migration(&env).ok_or(Error::NoMigrationProposed)?;
+        remove_emergency_migration(&env);
+        bump_instance(&env);
+        events::emergency_migration_cancelled(&env, &caller);
+        Ok(())
+    }
+
+    /// Read-only: pending emergency migration details, if any (Issue #679).
+    pub fn emergency_migration(env: Env) -> Option<EmergencyMigration> {
+        get_emergency_migration(&env)
+    }
+
+    /// Read-only: alias for emergency_migration (Issue #679).
+    pub fn get_emergency_migration(env: Env) -> Option<EmergencyMigration> {
+        get_emergency_migration(&env)
+    }
+
+    /// Read-only: the emergency migration timelock duration in seconds (Issue #679).
+    pub fn emergency_timelock_seconds(_env: Env) -> u64 {
+        EMERGENCY_MIGRATION_TIMELOCK_SECONDS
     }
 }

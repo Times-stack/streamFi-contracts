@@ -4,13 +4,13 @@ extern crate std;
 
 use soroban_sdk::{
     symbol_short,
-    testutils::{storage::Instance as _, Address as _, Events as _},
-    token, Address, Env, IntoVal, String, TryIntoVal,
+    testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
+    token, Address, Env, IntoVal, String, Symbol, TryIntoVal,
 };
 
 use crate::errors::Error;
 use crate::storage;
-use crate::TokenVaultClient;
+use crate::{DepositSpec, TokenVaultClient};
 
 struct Setup {
     env: Env,
@@ -73,12 +73,44 @@ fn deposit_respects_max_limit() {
 }
 
 #[test]
-fn deposit_rejects_amount_that_would_overflow_i128() {
-    let s = Setup::new(i128::MAX);
+fn balance_and_max_limit_getters_report_current_state() {
+    let s = Setup::new(1_000_000);
 
-    s.client.deposit(&s.owner, &(i128::MAX - 10));
-    let result = s.client.try_deposit(&s.owner, &20);
-    assert_eq!(result, Err(Ok(Error::ArithmeticOverflow)));
+    assert_eq!(s.client.balance(), Some(0));
+    assert_eq!(s.client.max_limit(), Some(1_000_000));
+
+    s.client.deposit(&s.owner, &100);
+    s.token.transfer(&s.user, &s.client.address, &25);
+    assert_eq!(s.client.balance(), Some(125));
+
+    s.client.set_limit(&s.owner, &2_000_000);
+    assert_eq!(s.client.max_limit(), Some(2_000_000));
+}
+
+#[test]
+fn deposit_rejects_amount_above_max_vault_deposit() {
+    let s = Setup::new(i128::MAX);
+    let too_large = crate::MAX_VAULT_DEPOSIT + 1;
+
+    assert_eq!(
+        s.client.try_deposit(&s.owner, &too_large),
+        Err(Ok(Error::DepositExceedsMax))
+    );
+    assert_eq!(
+        s.client.try_deposit_with_fee(&s.owner, &too_large, &1),
+        Err(Ok(Error::DepositExceedsMax))
+    );
+    assert_eq!(
+        s.client.try_batch_deposit(&soroban_sdk::vec![
+            &s.env,
+            DepositSpec {
+                from: s.owner.clone(),
+                amount: too_large
+            }
+        ]),
+        Err(Ok(Error::DepositExceedsMax))
+    );
+    assert_eq!(s.token.balance(&s.client.address), 0);
 }
 
 #[test]
@@ -129,6 +161,69 @@ fn withdraw_succeeds_with_real_owner_auth() {
     s.client.withdraw(&s.owner, &recipient, &400);
 
     assert_eq!(s.token.balance(&recipient), 400);
+}
+
+#[test]
+fn batch_withdraw_enforces_aggregate_operator_limit() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &1_000);
+
+    let operator = Address::generate(&s.env);
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    s.client.set_operator(&s.owner, &operator);
+    s.client.set_operator_withdraw_limit(&s.owner, &500);
+
+    let mut payouts = soroban_sdk::Vec::new(&s.env);
+    payouts.push_back((first.clone(), 300));
+    payouts.push_back((second.clone(), 300));
+    assert_eq!(
+        s.client.try_withdraw_batch(&operator, &payouts),
+        Err(Ok(Error::LimitExceeded))
+    );
+    assert_eq!(s.client.balance(), Some(1_000));
+    assert_eq!(s.token.balance(&first), 0);
+    assert_eq!(s.token.balance(&second), 0);
+}
+
+#[test]
+fn batch_withdraw_rejects_empty_payouts() {
+    let s = Setup::new(1_000_000);
+    let payouts = soroban_sdk::Vec::new(&s.env);
+    assert_eq!(
+        s.client.try_withdraw_batch(&s.owner, &payouts),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn batch_withdraw_emits_one_event_per_payout() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &1_000);
+
+    let operator = Address::generate(&s.env);
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    s.client.set_operator(&s.owner, &operator);
+    s.client.set_operator_withdraw_limit(&s.owner, &500);
+
+    let mut payouts = soroban_sdk::Vec::new(&s.env);
+    payouts.push_back((first.clone(), 300));
+    payouts.push_back((second.clone(), 200));
+    s.client.withdraw_batch(&operator, &payouts);
+
+    assert_eq!(s.client.balance(), Some(500));
+    assert_eq!(s.token.balance(&first), 300);
+    assert_eq!(s.token.balance(&second), 200);
+
+    let events = vault_events(&s);
+    assert_eq!(events.len(), 6);
+    let first_payload: (Address, i128, i128, bool) =
+        events[4].2.clone().try_into_val(&s.env).unwrap();
+    let second_payload: (Address, i128, i128, bool) =
+        events[5].2.clone().try_into_val(&s.env).unwrap();
+    assert_eq!(first_payload, (first, 300, 700, true));
+    assert_eq!(second_payload, (second, 200, 500, true));
 }
 
 #[test]
@@ -376,11 +471,11 @@ fn effective_withdraw_limit_reflects_owner_balance_and_operator_cap() {
     s.client.set_operator(&s.owner, &op);
     s.client.set_operator_withdraw_limit(&s.owner, &800);
 
-    assert_eq!(s.client.effective_withdraw_limit(&s.owner), Ok(500));
-    assert_eq!(s.client.effective_withdraw_limit(&op), Ok(500));
+    assert_eq!(s.client.effective_withdraw_limit(&s.owner), 500);
+    assert_eq!(s.client.effective_withdraw_limit(&op), 500);
 
     s.client.set_operator_withdraw_limit(&s.owner, &200);
-    assert_eq!(s.client.effective_withdraw_limit(&op), Ok(200));
+    assert_eq!(s.client.effective_withdraw_limit(&op), 200);
 }
 
 #[test]
@@ -685,7 +780,7 @@ fn keep_alive_emits_target_ttl() {
     let (_, topics, data) = events.last().unwrap();
     assert_eq!(
         topics.clone(),
-        (symbol_short!("kept_alive"),).into_val(&s.env)
+        (Symbol::new(&s.env, "kept_alive"),).into_val(&s.env)
     );
     let new_ttl: u32 = data.clone().try_into_val(&s.env).unwrap();
     assert_eq!(new_ttl, crate::TTL_EXTEND_TO);
@@ -921,6 +1016,44 @@ fn owner_can_propose_and_new_owner_accepts() {
 }
 
 #[test]
+fn expired_owner_proposal_requires_a_fresh_proposal() {
+    let s = Setup::new(1_000_000);
+    let new_owner = Address::generate(&s.env);
+    let proposed_at = s.env.ledger().timestamp();
+
+    assert_eq!(s.client.owner_proposal_ttl(), Some(7 * 24 * 60 * 60));
+    s.client.set_owner_proposal_ttl(&s.owner, &60);
+    s.client.propose_owner(&s.owner, &new_owner);
+    s.env.ledger().set_timestamp(proposed_at + 60);
+
+    assert_eq!(
+        s.client.try_accept_owner(&new_owner),
+        Err(Ok(Error::PendingOwnerExpired))
+    );
+    assert_eq!(s.client.owner(), Some(s.owner.clone()));
+    assert_eq!(s.client.pending_owner(), Some(new_owner.clone()));
+
+    s.client.propose_owner(&s.owner, &new_owner);
+    s.client.accept_owner(&new_owner);
+    assert_eq!(s.client.owner(), Some(new_owner));
+    assert_eq!(s.client.pending_owner(), None);
+}
+
+#[test]
+fn zero_owner_proposal_ttl_is_rejected() {
+    let s = Setup::new(1_000_000);
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.client.try_set_owner_proposal_ttl(&stranger, &60),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        s.client.try_set_owner_proposal_ttl(&s.owner, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
 fn pending_owner_and_proposer_are_readable() {
     let s = Setup::new(1_000_000);
     let new_owner = Address::generate(&s.env);
@@ -1052,7 +1185,6 @@ fn owner_transfer_emits_events() {
 }
 
 #[test]
-#[test]
 fn re_propose_overwrites_pending_owner() {
     let s = Setup::new(1_000_000);
     let first_pending = Address::generate(&s.env);
@@ -1107,6 +1239,7 @@ fn operations_during_pending_transfer_succeed() {
     assert_eq!(s.client.owner(), Some(new_owner));
 }
 
+#[test]
 fn uninitialized_vault_rejects_owner_transfer() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1124,4 +1257,272 @@ fn uninitialized_vault_rejects_owner_transfer() {
         client.try_accept_owner(&caller),
         Err(Ok(Error::NoPendingOwner))
     );
+}
+
+// ── Batch deposit tests ───────────────────────────────────────────────────
+
+#[test]
+fn batch_deposit_multiple_accounts_succeeds() {
+    let s = Setup::new(1_000_000);
+    let sponsor1 = Address::generate(&s.env);
+    let sponsor2 = Address::generate(&s.env);
+
+    let asset = token::StellarAssetClient::new(&s.env, &s.token.address);
+    asset.mint(&sponsor1, &10_000);
+    asset.mint(&sponsor2, &20_000);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        DepositSpec {
+            from: sponsor1.clone(),
+            amount: 5_000,
+        },
+        DepositSpec {
+            from: sponsor2.clone(),
+            amount: 15_000,
+        },
+    ];
+
+    s.client.batch_deposit(&deposits);
+
+    assert_eq!(s.token.balance(&s.client.address), 20_000);
+    assert_eq!(s.token.balance(&sponsor1), 5_000);
+    assert_eq!(s.token.balance(&sponsor2), 5_000);
+}
+
+#[test]
+fn batch_deposit_empty_fails() {
+    let s = Setup::new(1_000_000);
+    let empty_deposits = soroban_sdk::vec![&s.env];
+
+    assert_eq!(
+        s.client.try_batch_deposit(&empty_deposits),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn batch_deposit_zero_or_negative_amount_fails() {
+    let s = Setup::new(1_000_000);
+    let sponsor1 = Address::generate(&s.env);
+    let sponsor2 = Address::generate(&s.env);
+
+    let asset = token::StellarAssetClient::new(&s.env, &s.token.address);
+    asset.mint(&sponsor1, &10_000);
+    asset.mint(&sponsor2, &10_000);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        DepositSpec {
+            from: sponsor1,
+            amount: 5_000,
+        },
+        DepositSpec {
+            from: sponsor2,
+            amount: 0,
+        },
+    ];
+
+    assert_eq!(
+        s.client.try_batch_deposit(&deposits),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn batch_deposit_limit_exceeded_fails() {
+    let s = Setup::new(10_000);
+    let sponsor1 = Address::generate(&s.env);
+    let sponsor2 = Address::generate(&s.env);
+
+    let asset = token::StellarAssetClient::new(&s.env, &s.token.address);
+    asset.mint(&sponsor1, &10_000);
+    asset.mint(&sponsor2, &10_000);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        DepositSpec {
+            from: sponsor1,
+            amount: 6_000,
+        },
+        DepositSpec {
+            from: sponsor2,
+            amount: 5_000,
+        },
+    ];
+
+    assert_eq!(
+        s.client.try_batch_deposit(&deposits),
+        Err(Ok(Error::LimitExceeded))
+    );
+}
+
+#[test]
+fn batch_deposit_while_paused_fails() {
+    let s = Setup::new(1_000_000);
+    let sponsor = Address::generate(&s.env);
+
+    let asset = token::StellarAssetClient::new(&s.env, &s.token.address);
+    asset.mint(&sponsor, &10_000);
+
+    s.client.pause(&s.owner);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        DepositSpec {
+            from: sponsor,
+            amount: 5_000,
+        },
+    ];
+
+    assert_eq!(
+        s.client.try_batch_deposit(&deposits),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+// ── Emergency Migration tests (Issue #679) ────────────────────────────────
+
+#[test]
+fn emergency_migration_flow_enforces_timelock_and_transfers() {
+    let s = Setup::new(1_000_000);
+    let cold_storage = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+
+    s.client.deposit(&s.owner, &50_000);
+    assert_eq!(s.token.balance(&s.client.address), 50_000);
+
+    // Stranger cannot initiate
+    assert_eq!(
+        s.client
+            .try_initiate_emergency_migration(&stranger, &cold_storage),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Owner initiates
+    let now = s.env.ledger().timestamp();
+    s.client
+        .initiate_emergency_migration(&s.owner, &cold_storage);
+
+    let migration = s.client.emergency_migration().unwrap();
+    assert_eq!(migration.destination, cold_storage);
+    assert_eq!(migration.proposed_at, now);
+    assert_eq!(migration.executable_at, now + 48 * 3600);
+
+    // Stranger cannot execute
+    assert_eq!(
+        s.client.try_execute_emergency_migration(&stranger),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Before 48h timelock expires: fails
+    s.env.ledger().set_timestamp(now + 48 * 3600 - 1);
+    assert_eq!(
+        s.client.try_execute_emergency_migration(&s.owner),
+        Err(Ok(Error::TimelockNotExpired))
+    );
+
+    // At or after 48h: succeeds
+    s.env.ledger().set_timestamp(now + 48 * 3600);
+    let migrated = s.client.execute_emergency_migration(&s.owner);
+    assert_eq!(migrated, 50_000);
+
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.token.balance(&cold_storage), 50_000);
+    assert_eq!(s.client.emergency_migration(), None);
+}
+
+#[test]
+fn emergency_migration_can_be_cancelled() {
+    let s = Setup::new(1_000_000);
+    let cold_storage = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+
+    s.client
+        .initiate_emergency_migration(&s.owner, &cold_storage);
+    assert!(s.client.emergency_migration().is_some());
+
+    // Stranger cannot cancel
+    assert_eq!(
+        s.client.try_cancel_emergency_migration(&stranger),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Owner cancels
+    s.client.cancel_emergency_migration(&s.owner);
+    assert_eq!(s.client.emergency_migration(), None);
+
+    // Cancelling when none is pending fails
+    assert_eq!(
+        s.client.try_cancel_emergency_migration(&s.owner),
+        Err(Ok(Error::NoMigrationProposed))
+    );
+}
+
+#[test]
+fn test_deposit_with_fee_emits_token_deposited_event() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit_with_fee(&s.owner, &1_000, &50);
+
+    let events = vault_events(&s);
+    // initialized + deposited + token_deposited
+    assert_eq!(events.len(), 3);
+
+    let (_, topics, data) = &events[2];
+    assert_eq!(
+        topics.clone(),
+        (Symbol::new(&s.env, "TokenDeposited"), s.owner.clone()).into_val(&s.env)
+    );
+    let payload: crate::events::DepositEvent = data.clone().try_into_val(&s.env).unwrap();
+    assert_eq!(
+        payload,
+        crate::events::DepositEvent {
+            gross_amount: 1_000,
+            fee_amount: 50,
+            net_amount: 950,
+        }
+    );
+    assert_eq!(s.client.balance(), Some(950));
+}
+
+#[test]
+fn test_reentrancy_guard_blocks_nested_transfers() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &10_000);
+
+    // Simulate active transient reentrancy lock during an external token call
+    s.env.as_contract(&s.client.address, || {
+        s.env
+            .storage()
+            .temporary()
+            .set(&crate::storage::DataKey::ReentrancyLock, &true);
+    });
+
+    assert_eq!(
+        s.client.try_deposit(&s.owner, &1_000),
+        Err(Ok(Error::ReentrancyDetected))
+    );
+    assert_eq!(
+        s.client.try_withdraw(&s.owner, &s.user, &1_000),
+        Err(Ok(Error::ReentrancyDetected))
+    );
+    assert_eq!(
+        s.client
+            .try_deposit_token(&s.owner, &s.token.address, &1_000),
+        Err(Ok(Error::ReentrancyDetected))
+    );
+    assert_eq!(
+        s.client
+            .try_withdraw_token(&s.owner, &s.token.address, &s.user, &1_000),
+        Err(Ok(Error::ReentrancyDetected))
+    );
+
+    // Clear lock and verify transfers succeed again and clean up transient lock
+    s.env.as_contract(&s.client.address, || {
+        s.env
+            .storage()
+            .temporary()
+            .remove(&crate::storage::DataKey::ReentrancyLock);
+    });
+    assert!(s.client.try_withdraw(&s.owner, &s.user, &1_000).is_ok());
 }

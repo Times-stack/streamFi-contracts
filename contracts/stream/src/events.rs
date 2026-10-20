@@ -84,14 +84,21 @@ pub fn withdrawn(
     );
 }
 
-pub fn cancelled(env: &Env, sender: &Address, refund_amount: i128, withdrawn_so_far: i128) {
+pub fn cancelled(
+    env: &Env,
+    sender: &Address,
+    refund_amount: i128,
+    withdrawn_so_far: i128,
+    remaining_deposit: i128,
+) {
     assert_non_negative_amount(env, refund_amount);
     assert_non_negative_amount(env, withdrawn_so_far);
+    assert_non_negative_amount(env, remaining_deposit);
 
     let sequence = next_sequence(env);
     env.events().publish(
         (symbol_short!("cancelled"), sender.clone(), sequence),
-        (refund_amount, withdrawn_so_far),
+        (refund_amount, withdrawn_so_far, remaining_deposit),
     );
 }
 
@@ -99,14 +106,21 @@ pub fn cancelled(env: &Env, sender: &Address, refund_amount: i128, withdrawn_so_
 /// the stream paused past the threshold. Distinct from `cancelled` (the
 /// sender/operator-initiated path via `cancel`) so consumers of the event log
 /// can tell the two apart without correlating who signed the transaction.
-pub fn force_cancelled(env: &Env, sender: &Address, refund_amount: i128, withdrawn_so_far: i128) {
+pub fn force_cancelled(
+    env: &Env,
+    sender: &Address,
+    refund_amount: i128,
+    withdrawn_so_far: i128,
+    remaining_deposit: i128,
+) {
     assert_non_negative_amount(env, refund_amount);
     assert_non_negative_amount(env, withdrawn_so_far);
+    assert_non_negative_amount(env, remaining_deposit);
 
     let sequence = next_sequence(env);
     env.events().publish(
         (symbol_short!("force_cxl"), sender.clone(), sequence),
-        (refund_amount, withdrawn_so_far),
+        (refund_amount, withdrawn_so_far, remaining_deposit),
     );
 }
 
@@ -136,6 +150,40 @@ pub fn topped_up(env: &Env, sender: &Address, amount: i128, new_balance: i128) {
     env.events().publish(
         (symbol_short!("topped_up"), sender.clone(), sequence),
         (amount, new_balance),
+    );
+}
+
+/// Publish a single event for the atomic `top_up_and_extend` transition.
+///
+/// A dedicated event prevents indexers from having to correlate independent
+/// top-up and duration-extension records from the same transaction.
+pub fn topped_up_and_extended(
+    env: &Env,
+    caller: &Address,
+    old_balance: i128,
+    new_balance: i128,
+    old_end_time: u64,
+    new_end_time: u64,
+) {
+    assert_non_negative_amount(env, old_balance);
+    assert_non_negative_amount(env, new_balance);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("top_ext"), caller.clone(), sequence),
+        (old_balance, new_balance, old_end_time, new_end_time),
+    );
+}
+
+/// Publish a prospective stream-rate change.
+pub fn rate_changed(env: &Env, caller: &Address, old_rate: i128, new_rate: i128) {
+    assert_non_negative_amount(env, old_rate);
+    assert_non_negative_amount(env, new_rate);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("rate_chg"), caller.clone(), sequence),
+        (old_rate, new_rate),
     );
 }
 
@@ -174,4 +222,81 @@ pub fn operator_revoked(env: &Env, sender: &Address) {
     let sequence = next_sequence(env);
     env.events()
         .publish((symbol_short!("rm_op"), sender.clone(), sequence), ());
+}
+
+pub fn split_recipient_set(
+    env: &Env,
+    caller: &Address,
+    secondary_recipient: &Address,
+    split_bps: u32,
+) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            symbol_short!("set_split"),
+            caller.clone(),
+            secondary_recipient.clone(),
+            sequence,
+        ),
+        split_bps,
+    );
+}
+
+pub fn split_recipient_removed(env: &Env, caller: &Address) {
+    let sequence = next_sequence(env);
+    env.events()
+        .publish((symbol_short!("rm_split"), caller.clone(), sequence), ());
+}
+
+pub fn cliff_configured(env: &Env, sender: &Address, cliff_time: u64, cliff_unlock_amount: i128) {
+    assert_non_negative_amount(env, cliff_unlock_amount);
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("set_cliff"), sender.clone(), sequence),
+        (cliff_time, cliff_unlock_amount),
+    );
+}
+
+pub fn min_withdrawal_interval_set(env: &Env, sender: &Address, interval_seconds: u64) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("min_w_int"), sender.clone(), sequence),
+        interval_seconds,
+    );
+}
+
+pub fn emergency_paused(env: &Env, caller: &Address, timestamp: u64) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("emg_pause"), caller.clone(), sequence),
+        timestamp,
+    );
+}
+
+pub fn emergency_unpaused(env: &Env, caller: &Address, timestamp: u64) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("emg_unps"), caller.clone(), sequence),
+        timestamp,
+    );
+}
+
+/// Publish a milestone event when a cliff timestamp has been reached and passed (Issue #676).
+pub fn cliff_reached(env: &Env, recipient: &Address, timestamp: u64, unlock_amount: i128) {
+    assert_non_negative_amount(env, unlock_amount);
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("cliff_rch"), recipient.clone(), sequence),
+        (timestamp, unlock_amount),
+    );
+}
+
+/// Publish a milestone event when a stream naturally runs to completion and is fully settled to zero remaining balance (Issue #676).
+pub fn stream_completed(env: &Env, recipient: &Address, total_withdrawn: i128) {
+    assert_non_negative_amount(env, total_withdrawn);
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("completed"), recipient.clone(), sequence),
+        total_withdrawn,
+    );
 }

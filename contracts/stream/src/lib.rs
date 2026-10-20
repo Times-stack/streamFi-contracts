@@ -9,12 +9,21 @@ pub mod storage;
 mod tests;
 mod ttl;
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String};
 
 use drip_common::{is_zero_address, pause};
 
 pub use errors::Error;
-use storage::{DataKey, StreamInfo, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED};
+pub use storage::{CliffConfig, SplitConfig, StreamConfig, StreamStatus, StreamSummary};
+use storage::{
+    DataKey, RateCheckpoint, StreamInfo, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED, FLAG_REGULATED_ASSET,
+};
+
+/// Minimum duration for a bounded stream, in seconds (#847).
+pub const MIN_STREAM_DURATION: u64 = 60;
+
+/// Maximum byte length of the optional human-readable description (#845).
+pub const MAX_DESCRIPTION_LEN: u32 = 128;
 
 #[contract]
 pub struct DripStream;
@@ -89,6 +98,8 @@ impl DripStream {
         end_time: u64,
         clawback_enabled: bool,
         force_cancel_pause_secs: u64,
+        is_regulated_asset: bool,
+        description: Option<String>,
     ) {
         if env.storage().instance().has(&DataKey::Config) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -138,6 +149,20 @@ impl DripStream {
             panic_with_error!(&env, Error::InvalidTimeRange);
         }
 
+        // A stream that lasts only a second or two makes the rate math
+        // degenerate (truncation to zero for realistic rates). Require a
+        // meaningful minimum for bounded streams (#847). Open-ended streams
+        // use `end_time == 0` as a sentinel and are unaffected.
+        if end_time > 0 && end_time - start_time < MIN_STREAM_DURATION {
+            panic_with_error!(&env, Error::StreamDurationTooShort);
+        }
+
+        if let Some(ref desc) = description {
+            if desc.len() > MAX_DESCRIPTION_LEN {
+                panic_with_error!(&env, Error::DescriptionTooLong);
+            }
+        }
+
         // A bounded stream must not overflow its total obligation up front.
         // Once enough time elapses, `streamed_amount` multiplies `rate_per_second`
         // by `elapsed` and would otherwise return `ArithmeticOverflow` in
@@ -160,18 +185,35 @@ impl DripStream {
             panic_with_error!(&env, Error::BackdatedStream);
         }
 
-        ttl::bump(&env);
+        ttl::bump_for_remaining(&env, end_time.saturating_sub(now));
 
         let mut flags: u32 = 0;
         if clawback_enabled {
             flags |= FLAG_CLAWBACK_ENABLED;
         }
+        if is_regulated_asset {
+            flags |= FLAG_REGULATED_ASSET;
+        }
 
         let s = env.storage().instance();
+        if let Some(desc) = description {
+            s.set(&DataKey::StreamDescription, &desc);
+        }
         s.set(&DataKey::StorageVersion, &storage::CURRENT_STORAGE_VERSION);
         s.set(
             &DataKey::ForceCancelPauseThresholdSecs,
             &force_cancel_pause_secs,
+        );
+        s.set(
+            &DataKey::ImmutableConfig,
+            &storage::ImmutableConfig {
+                start_time,
+                stop_time: end_time,
+                token: token.clone(),
+                rate_per_second,
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+            },
         );
 
         // Write the initial state before emitting the creation event so the
@@ -191,6 +233,7 @@ impl DripStream {
                 withdrawn: 0,
                 paused_at: 0,
                 event_sequence: 0,
+                cumulative_fees: 0,
             },
         );
 
@@ -220,6 +263,23 @@ impl DripStream {
         let info = state::load(env);
         state::assert_not_cancelled(&info)?;
         info.recipient.require_auth();
+
+        let min_interval: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinWithdrawalInterval)
+            .unwrap_or(0);
+        if min_interval > 0 {
+            let now = env.ledger().timestamp();
+            let last_withdrawal: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::LastWithdrawalTime)
+                .unwrap_or(0);
+            if last_withdrawal > 0 && now < last_withdrawal.saturating_add(min_interval) {
+                return Err(Error::WithdrawalTooFrequent);
+            }
+        }
 
         // `available` is the recipient's accrued-but-unwithdrawn entitlement
         // (rate * elapsed - withdrawn). If nothing has accrued yet there is
@@ -261,15 +321,60 @@ impl DripStream {
         state::save(env, &updated);
 
         // Perform the transfer, then derive `remaining` from the single balance
-        // captured above. `checked_sub` (rather than a bare `-`) guarantees no
-        // underflow panic even if a fee-on-transfer / rebasing token leaves the
-        // contract with less than `to_send`; the withdrawal is reverted instead.
-        tk.transfer(&contract_addr, &info.recipient, &to_send);
+        let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
+        if let Some(split) = split_opt {
+            let secondary_amount = to_send
+                .checked_mul(split.split_bps as i128)
+                .ok_or(Error::ArithmeticOverflow)?
+                / 10_000;
+            let primary_amount = to_send
+                .checked_sub(secondary_amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            if primary_amount > 0 {
+                tk.transfer(&contract_addr, &info.recipient, &primary_amount);
+            }
+            if secondary_amount > 0 {
+                tk.transfer(
+                    &contract_addr,
+                    &split.secondary_recipient,
+                    &secondary_amount,
+                );
+            }
+        } else {
+            tk.transfer(&contract_addr, &info.recipient, &to_send);
+        }
+
+        let now = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::LastWithdrawalTime, &now);
 
         let remaining = balance
             .checked_sub(to_send)
             .ok_or(Error::ArithmeticOverflow)?;
         events::withdrawn(env, &info.recipient, to_send, new_withdrawn, remaining);
+
+        // Check if cliff timestamp was reached and emit event once (Issue #676)
+        let cliff_opt: Option<CliffConfig> = env.storage().instance().get(&DataKey::CliffConfig);
+        if let Some(cliff) = cliff_opt {
+            if now >= cliff.cliff_time && !env.storage().instance().has(&DataKey::CliffReached) {
+                env.storage().instance().set(&DataKey::CliffReached, &true);
+                events::cliff_reached(env, &info.recipient, now, cliff.cliff_unlock_amount);
+            }
+        }
+
+        // Emit stream_completed event on final withdrawal when remaining balance reaches zero (Issue #676)
+        if remaining == 0
+            && (info.end_time > 0 || balance > 0)
+            && !env.storage().instance().has(&DataKey::StreamCompleted)
+        {
+            env.storage()
+                .instance()
+                .set(&DataKey::StreamCompleted, &true);
+            events::stream_completed(env, &info.recipient, new_withdrawn);
+        }
+
         Ok(to_send)
     }
 
@@ -292,6 +397,14 @@ impl DripStream {
 
         let info = state::load(env);
         state::assert_not_cancelled(&info)?;
+
+        let cfg_opt: Option<StreamConfig> = env.storage().instance().get(&DataKey::StreamConfig);
+        if let Some(cfg) = cfg_opt {
+            if !cfg.is_cancelable {
+                return Err(Error::StreamNotCancelable);
+            }
+        }
+
         require_sender_or_operator(env, caller, &info.sender)?;
 
         let tk = token::Client::new(env, &info.token);
@@ -324,7 +437,29 @@ impl DripStream {
 
         // Pay the recipient their earned-but-unwithdrawn portion.
         if owed_to_recipient > 0 {
-            tk.transfer(&contract_addr, &info.recipient, &owed_to_recipient);
+            let split_opt: Option<SplitConfig> =
+                env.storage().instance().get(&DataKey::SplitConfig);
+            if let Some(split) = split_opt {
+                let secondary_amount = owed_to_recipient
+                    .checked_mul(split.split_bps as i128)
+                    .ok_or(Error::ArithmeticOverflow)?
+                    / 10_000;
+                let primary_amount = owed_to_recipient
+                    .checked_sub(secondary_amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if primary_amount > 0 {
+                    tk.transfer(&contract_addr, &info.recipient, &primary_amount);
+                }
+                if secondary_amount > 0 {
+                    tk.transfer(
+                        &contract_addr,
+                        &split.secondary_recipient,
+                        &secondary_amount,
+                    );
+                }
+            } else {
+                tk.transfer(&contract_addr, &info.recipient, &owed_to_recipient);
+            }
         }
 
         // Refund the unstreamed remainder to the sender.
@@ -332,11 +467,46 @@ impl DripStream {
             tk.transfer(&contract_addr, &info.sender, &refund_to_sender);
         }
 
-        events::cancelled(env, &info.sender, refund_to_sender, total_withdrawn);
+        events::cancelled(
+            env,
+            &info.sender,
+            refund_to_sender,
+            total_withdrawn,
+            refund_to_sender,
+        );
         Ok(())
     }
 
     /// Sender or delegated operator pauses the stream.
+    /// Read-only: whether the stream is under an emergency administrative freeze (Issue #699).
+    pub fn is_emergency_paused(env: Env) -> bool {
+        drip_common::pause::is_paused(&env, &DataKey::EmergencyPaused)
+    }
+
+    /// Freezes the stream under an emergency administrative halt (Issue #699).
+    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+        if Self::is_emergency_paused(env.clone()) {
+            return Err(Error::AlreadyPaused);
+        }
+        ttl::bump(&env);
+        let _ = drip_common::pause::set_paused(&env, &DataKey::EmergencyPaused, true);
+        events::emergency_paused(&env, &caller, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Lifts the emergency administrative freeze (Issue #699).
+    pub fn emergency_unpause(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+        if !Self::is_emergency_paused(env.clone()) {
+            return Err(Error::NotPaused);
+        }
+        ttl::bump(&env);
+        let _ = drip_common::pause::set_paused(&env, &DataKey::EmergencyPaused, false);
+        events::emergency_unpaused(&env, &caller, env.ledger().timestamp());
+        Ok(())
+    }
+
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         state::with_guard(&env, |env| Self::_pause(env, &caller))
     }
@@ -394,6 +564,26 @@ impl DripStream {
             .checked_sub(info.paused_at)
             .ok_or(Error::ArithmeticOverflow)?;
 
+        // If a rate change has already become active, move its accrual
+        // checkpoint forward by the paused duration just like start/end time.
+        // A checkpoint that is still in the future (for example at a pending
+        // cliff) is left untouched, matching the existing cliff semantics.
+        if let Some(mut checkpoint) = env
+            .storage()
+            .instance()
+            .get::<_, RateCheckpoint>(&DataKey::RateCheckpoint)
+        {
+            if checkpoint.at <= info.paused_at {
+                checkpoint.at = checkpoint
+                    .at
+                    .checked_add(paused_duration)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RateCheckpoint, &checkpoint);
+            }
+        }
+
         // A stream that stays paused beyond the protocol's safe grace window is
         // at risk of instance-storage archival; reject the resume before the host
         // turns this into the opaque "entry archived" error path. The same
@@ -424,8 +614,98 @@ impl DripStream {
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         state::save(env, &updated);
+        if updated.end_time > 0 {
+            ttl::bump_for_remaining(env, updated.end_time.saturating_sub(now));
+        }
 
         events::resumed(env, caller, now);
+        Ok(())
+    }
+
+    /// Sender or delegated operator changes the stream's payout rate.
+    ///
+    /// The new rate is prospective: value accrued under the old rate is
+    /// checkpointed before the rate is updated, so already-earned value is
+    /// never retroactively repriced. The caller may change the rate on a
+    /// pending, active, or paused stream; a completed/cancelled stream is
+    /// rejected.
+    pub fn change_rate(env: Env, caller: Address, new_rate_per_second: i128) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            Self::_change_rate(env, &caller, new_rate_per_second)
+        })
+    }
+
+    fn _change_rate(env: &Env, caller: &Address, new_rate_per_second: i128) -> Result<(), Error> {
+        if new_rate_per_second <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let mut info = state::load(env);
+        state::assert_not_cancelled(&info)?;
+        require_sender_or_operator(env, caller, &info.sender)?;
+
+        let now = env.ledger().timestamp();
+        if info.end_time > 0 && now >= info.end_time {
+            return Err(Error::StreamEnded);
+        }
+
+        // Compute the value earned under the old rate before changing it.
+        let accrued = math::streamed_amount(env, &info)?;
+
+        // If currently paused, the new rate starts when the stream resumes,
+        // not while wall-clock time is frozen at paused_at.
+        let effective_change_time = if info.is_paused() {
+            info.paused_at
+        } else {
+            now
+        };
+
+        // Before start/cliff, the checkpoint lives at the first timestamp at
+        // which value can accrue. For a cliffed stream the upfront unlock is
+        // included exactly at the cliff boundary.
+        let cliff_cfg: Option<CliffConfig> = env.storage().instance().get(&DataKey::CliffConfig);
+        let (checkpoint_at, checkpoint_accrued) = if let Some(cfg) = cliff_cfg {
+            if effective_change_time < cfg.cliff_time {
+                (cfg.cliff_time, cfg.cliff_unlock_amount)
+            } else {
+                (effective_change_time, accrued)
+            }
+        } else if effective_change_time < info.start_time {
+            (info.start_time, 0)
+        } else {
+            (effective_change_time, accrued)
+        };
+
+        // Re-run the bounded-stream overflow invariant with the new rate.
+        // This is the same class of guard initialize performs, but includes
+        // any value already accrued before this rate change.
+        if info.end_time > 0 && checkpoint_at < info.end_time {
+            let remaining = info
+                .end_time
+                .checked_sub(checkpoint_at)
+                .ok_or(Error::ArithmeticOverflow)? as i128;
+            let future = new_rate_per_second
+                .checked_mul(remaining)
+                .ok_or(Error::ArithmeticOverflow)?;
+            checkpoint_accrued
+                .checked_add(future)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+
+        ttl::bump(env);
+
+        let old_rate = info.rate_per_second;
+        info.rate_per_second = new_rate_per_second;
+        state::save(env, &info);
+        env.storage().instance().set(
+            &DataKey::RateCheckpoint,
+            &RateCheckpoint {
+                accrued: checkpoint_accrued,
+                at: checkpoint_at,
+            },
+        );
+
+        events::rate_changed(env, caller, old_rate, new_rate_per_second);
         Ok(())
     }
 
@@ -436,6 +716,9 @@ impl DripStream {
     /// cancellation check -- so an unauthenticated call fails as cheaply
     /// as possible instead of paying for storage-extension instructions
     /// it never needed.
+    /// Deposits additional tokens into the stream (Issue #690: permits external gift funding).
+    ///
+    /// Callable by any authenticated account (sender, recipient, operator, or third-party benefactor).
     pub fn top_up(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
         state::with_guard(&env, |env| Self::_top_up(env, &caller, amount))
     }
@@ -446,7 +729,7 @@ impl DripStream {
         }
 
         let info = state::load(env);
-        require_sender_or_operator(env, caller, &info.sender)?;
+        caller.require_auth();
 
         ttl::bump(env);
         state::assert_not_cancelled(&info)?;
@@ -544,6 +827,7 @@ impl DripStream {
         let mut updated = info.clone();
         updated.end_time = end_time;
         state::save(env, &updated);
+        ttl::bump_for_remaining(env, end_time.saturating_sub(env.ledger().timestamp()));
 
         // Emit topped_up event to indicate funds were deposited
         let new_balance = tk.balance(&contract_addr);
@@ -605,6 +889,7 @@ impl DripStream {
 
         let tk = token::Client::new(env, &info.token);
         let contract_addr = env.current_contract_address();
+        let old_balance = tk.balance(&contract_addr);
 
         // Transfer funds from the caller (sender or operator) into the
         // contract. See `_top_up` for why this isn't always `info.sender`.
@@ -619,9 +904,17 @@ impl DripStream {
         let mut updated = info.clone();
         updated.end_time = new_end_time;
         state::save(env, &updated);
+        ttl::bump_for_remaining(env, new_end_time.saturating_sub(env.ledger().timestamp()));
 
         let new_balance = tk.balance(&contract_addr);
-        events::topped_up(env, caller, amount, new_balance);
+        events::topped_up_and_extended(
+            env,
+            caller,
+            old_balance,
+            new_balance,
+            info.end_time,
+            new_end_time,
+        );
 
         Ok(())
     }
@@ -669,6 +962,67 @@ impl DripStream {
             return Ok(0);
         }
         math::withdrawable(&env, &info)
+    }
+
+    /// Read-only: dry-run validation for a proposed withdrawal amount.
+    ///
+    /// Runs all pre-transfer validation checks performed by `withdraw()`
+    /// (amount positivity, stream state, rate limits, accrual, and token balance)
+    /// without mutating state or performing token transfers.
+    pub fn validate_withdraw(env: Env, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+
+        let min_interval: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinWithdrawalInterval)
+            .unwrap_or(0);
+        if min_interval > 0 {
+            let now = env.ledger().timestamp();
+            let last_withdrawal: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::LastWithdrawalTime)
+                .unwrap_or(0);
+            if last_withdrawal > 0 && now < last_withdrawal.saturating_add(min_interval) {
+                return Err(Error::WithdrawalTooFrequent);
+            }
+        }
+
+        let available = math::withdrawable(&env, &info)?;
+        if available == 0 {
+            return Err(Error::NothingToWithdraw);
+        }
+
+        let tk = token::Client::new(&env, &info.token);
+        let contract_addr = env.current_contract_address();
+        let balance = tk.balance(&contract_addr);
+        let to_send = amount.min(available).min(balance);
+        if to_send == 0 {
+            return Err(Error::StreamUnderfunded);
+        }
+
+        let _new_withdrawn = info
+            .withdrawn
+            .checked_add(to_send)
+            .ok_or(Error::ArithmeticOverflow)?;
+
+        let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
+        if let Some(split) = split_opt {
+            let secondary_amount = to_send
+                .checked_mul(split.split_bps as i128)
+                .ok_or(Error::ArithmeticOverflow)?
+                / 10_000;
+            to_send
+                .checked_sub(secondary_amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+
+        Ok(())
     }
 
     /// Read-only: whether clawback is enabled for this stream.
@@ -747,13 +1101,41 @@ impl DripStream {
         state::save(env, &cancelled_info);
 
         if owed_to_recipient > 0 {
-            tk.transfer(&contract_addr, &info.recipient, &owed_to_recipient);
+            let split_opt: Option<SplitConfig> =
+                env.storage().instance().get(&DataKey::SplitConfig);
+            if let Some(split) = split_opt {
+                let secondary_amount = owed_to_recipient
+                    .checked_mul(split.split_bps as i128)
+                    .ok_or(Error::ArithmeticOverflow)?
+                    / 10_000;
+                let primary_amount = owed_to_recipient
+                    .checked_sub(secondary_amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if primary_amount > 0 {
+                    tk.transfer(&contract_addr, &info.recipient, &primary_amount);
+                }
+                if secondary_amount > 0 {
+                    tk.transfer(
+                        &contract_addr,
+                        &split.secondary_recipient,
+                        &secondary_amount,
+                    );
+                }
+            } else {
+                tk.transfer(&contract_addr, &info.recipient, &owed_to_recipient);
+            }
         }
         if refund_to_sender > 0 {
             tk.transfer(&contract_addr, &info.sender, &refund_to_sender);
         }
 
-        events::force_cancelled(env, &info.sender, refund_to_sender, total_withdrawn);
+        events::force_cancelled(
+            env,
+            &info.sender,
+            refund_to_sender,
+            total_withdrawn,
+            refund_to_sender,
+        );
         Ok(())
     }
 
@@ -856,6 +1238,134 @@ impl DripStream {
         env.storage().instance().get(&DataKey::Operator)
     }
 
+    /// Configure a secondary recipient and basis point split (e.g. 2000 for 20%).
+    ///
+    /// Callable by sender, delegated operator, or current recipient.
+    pub fn set_split_recipient(
+        env: Env,
+        caller: Address,
+        secondary_recipient: Address,
+        split_bps: u32,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            Self::_set_split_recipient(env, &caller, &secondary_recipient, split_bps)
+        })
+    }
+
+    fn _set_split_recipient(
+        env: &Env,
+        caller: &Address,
+        secondary_recipient: &Address,
+        split_bps: u32,
+    ) -> Result<(), Error> {
+        ttl::bump(env);
+        let info = state::load(env);
+        state::assert_not_cancelled(&info)?;
+
+        let operator = env.storage().instance().get(&DataKey::Operator);
+        let is_sender = caller == &info.sender;
+        let is_op = operator.as_ref().map(|op| caller == op).unwrap_or(false);
+        let is_recipient = caller == &info.recipient;
+
+        if !is_sender && !is_op && !is_recipient {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        if split_bps == 0 || split_bps >= 10_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if is_zero_address(env, secondary_recipient)
+            || secondary_recipient == &info.sender
+            || secondary_recipient == &info.recipient
+        {
+            return Err(Error::InvalidRecipient);
+        }
+
+        let config = SplitConfig {
+            secondary_recipient: secondary_recipient.clone(),
+            split_bps,
+        };
+        env.storage().instance().set(&DataKey::SplitConfig, &config);
+
+        events::split_recipient_set(env, caller, secondary_recipient, split_bps);
+        Ok(())
+    }
+
+    /// Remove the configured split recipient, directing 100% of future claims to the primary recipient.
+    pub fn remove_split_recipient(env: Env, caller: Address) -> Result<(), Error> {
+        state::with_guard(&env, |env| Self::_remove_split_recipient(env, &caller))
+    }
+
+    fn _remove_split_recipient(env: &Env, caller: &Address) -> Result<(), Error> {
+        ttl::bump(env);
+        let info = state::load(env);
+        state::assert_not_cancelled(&info)?;
+
+        let operator = env.storage().instance().get(&DataKey::Operator);
+        let is_sender = caller == &info.sender;
+        let is_op = operator.as_ref().map(|op| caller == op).unwrap_or(false);
+        let is_recipient = caller == &info.recipient;
+
+        if !is_sender && !is_op && !is_recipient {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        env.storage().instance().remove(&DataKey::SplitConfig);
+        events::split_recipient_removed(env, caller);
+        Ok(())
+    }
+
+    /// Read-only: get the configured split configuration, if any.
+    pub fn split_recipient(env: Env) -> Option<SplitConfig> {
+        env.storage().instance().get(&DataKey::SplitConfig)
+    }
+
+    /// Sender updates the stream's title (descriptive name).
+    pub fn set_stream_title(env: Env, caller: Address, title: String) -> Result<(), Error> {
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::bump(&env);
+
+        env.storage().instance().set(&DataKey::StreamTitle, &title);
+        Ok(())
+    }
+
+    /// Sender updates the stream's reference tag (e.g. invoice, order ID).
+    pub fn set_reference_tag(env: Env, caller: Address, tag: String) -> Result<(), Error> {
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::bump(&env);
+
+        env.storage().instance().set(&DataKey::ReferenceTag, &tag);
+        Ok(())
+    }
+
+    /// Read-only: the optional description supplied at creation (#845).
+    pub fn description(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::StreamDescription)
+    }
+
+    /// Read-only: the current stream title, if set.
+    pub fn stream_title(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::StreamTitle)
+    }
+
+    /// Read-only: the current reference tag, if set.
+    pub fn reference_tag(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ReferenceTag)
+    }
+
     /// Read-only: total tokens streamed so far (regardless of withdrawals).
     ///
     /// Useful for UIs that want to show "X streamed, Y withdrawn, Z remaining"
@@ -880,6 +1390,36 @@ impl DripStream {
         state::load(&env)
     }
 
+    /// Read-only: the stream sender.
+    pub fn sender(env: Env) -> Address {
+        state::load(&env).sender
+    }
+
+    /// Read-only: the stream recipient.
+    pub fn recipient(env: Env) -> Address {
+        state::load(&env).recipient
+    }
+
+    /// Read-only: the token escrowed by this stream.
+    pub fn token(env: Env) -> Address {
+        state::load(&env).token
+    }
+
+    /// Read-only: the stream's current rate per second.
+    pub fn rate_per_second(env: Env) -> i128 {
+        state::load(&env).rate_per_second
+    }
+
+    /// Read-only: whether this stream has no scheduled end time.
+    pub fn is_open_ended(env: Env) -> bool {
+        state::load(&env).end_time == 0
+    }
+
+    /// Read-only: maximum safe pause duration, in seconds.
+    pub fn max_pause_secs(_env: Env) -> u64 {
+        ttl::MAX_PAUSE_SECS
+    }
+
     /// Latest committed event sequence.
     ///
     /// Event consumers can compare this value with the last sequence they
@@ -900,5 +1440,197 @@ impl DripStream {
             .instance()
             .get(&DataKey::StorageVersion)
             .unwrap_or(0)
+    }
+
+    /// Read-only: consolidated stream summary in a single call.
+    pub fn get_summary(env: Env) -> StreamSummary {
+        let info = state::load(&env);
+        let now = env.ledger().timestamp();
+
+        let status = if info.is_cancelled() {
+            StreamStatus::Cancelled
+        } else if info.is_paused() {
+            StreamStatus::Paused
+        } else if now < info.start_time {
+            StreamStatus::Pending
+        } else if info.end_time > 0 && now >= info.end_time {
+            StreamStatus::Completed
+        } else {
+            StreamStatus::Active
+        };
+
+        let streamed_amount = Self::streamed_total(env.clone()).unwrap_or(0);
+
+        let total_amount = if info.end_time > info.start_time {
+            (info.end_time - info.start_time) as i128 * info.rate_per_second
+        } else {
+            let tk = soroban_sdk::token::Client::new(&env, &info.token);
+            tk.balance(&env.current_contract_address()) + info.withdrawn
+        };
+
+        StreamSummary {
+            sender: info.sender,
+            recipient: info.recipient,
+            token: info.token,
+            total_amount,
+            streamed_amount,
+            status,
+            start_time: info.start_time,
+            stop_time: info.end_time,
+        }
+    }
+
+    /// Read-only alias for `get_summary`.
+    pub fn get_stream_summary(env: Env) -> StreamSummary {
+        Self::get_summary(env)
+    }
+
+    /// Set a cliff unlock configuration for this stream (Issue #719).
+    ///
+    /// Credits `cliff_unlock_amount` immediately upon `cliff_time` expiration,
+    /// followed by linear streaming of remaining funds.
+    pub fn set_cliff(
+        env: Env,
+        caller: Address,
+        cliff_time: u64,
+        cliff_unlock_amount: i128,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            Self::_set_cliff(env, &caller, cliff_time, cliff_unlock_amount)
+        })
+    }
+
+    fn _set_cliff(
+        env: &Env,
+        caller: &Address,
+        cliff_time: u64,
+        cliff_unlock_amount: i128,
+    ) -> Result<(), Error> {
+        ttl::bump(env);
+        let info = state::load(env);
+        state::assert_not_cancelled(&info)?;
+        require_sender_or_operator(env, caller, &info.sender)?;
+
+        if cliff_unlock_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if cliff_time < info.start_time || (info.end_time > 0 && cliff_time >= info.end_time) {
+            return Err(Error::InvalidTimeRange);
+        }
+
+        let cfg = CliffConfig {
+            cliff_time,
+            cliff_unlock_amount,
+        };
+        env.storage().instance().set(&DataKey::CliffConfig, &cfg);
+        events::cliff_configured(env, caller, cliff_time, cliff_unlock_amount);
+        Ok(())
+    }
+
+    /// Read-only: get the configured cliff configuration, if any (Issue #719).
+    pub fn cliff_config(env: Env) -> Option<CliffConfig> {
+        env.storage().instance().get(&DataKey::CliffConfig)
+    }
+
+    /// Set a configurable minimum withdrawal interval in seconds (Issue #693).
+    pub fn set_min_withdrawal_interval(
+        env: Env,
+        caller: Address,
+        interval_seconds: u64,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            Self::_set_min_withdrawal_interval(env, &caller, interval_seconds)
+        })
+    }
+
+    fn _set_min_withdrawal_interval(
+        env: &Env,
+        caller: &Address,
+        interval_seconds: u64,
+    ) -> Result<(), Error> {
+        ttl::bump(env);
+        let info = state::load(env);
+        state::assert_not_cancelled(&info)?;
+        require_sender_or_operator(env, caller, &info.sender)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinWithdrawalInterval, &interval_seconds);
+        events::min_withdrawal_interval_set(env, caller, interval_seconds);
+        Ok(())
+    }
+
+    /// Read-only: get configured minimum withdrawal interval in seconds.
+    pub fn min_withdrawal_interval(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinWithdrawalInterval)
+            .unwrap_or(0)
+    }
+
+    /// Read-only: get timestamp of last withdrawal.
+    pub fn last_withdrawal_time(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastWithdrawalTime)
+            .unwrap_or(0)
+    }
+
+    /// Read-only: get immutable configuration fields from instance storage (Issue #702).
+    pub fn immutable_config(env: Env) -> Result<storage::ImmutableConfig, Error> {
+        if let Some(cfg) = env.storage().instance().get(&DataKey::ImmutableConfig) {
+            return Ok(cfg);
+        }
+        let info = state::try_load(&env)?;
+        Ok(storage::ImmutableConfig {
+            start_time: info.start_time,
+            stop_time: info.end_time,
+            token: info.token,
+            rate_per_second: info.rate_per_second,
+            sender: info.sender,
+            recipient: info.recipient,
+        })
+    }
+
+    /// Read-only alias for immutable_config (Issue #702).
+    pub fn get_immutable_config(env: Env) -> Result<storage::ImmutableConfig, Error> {
+        Self::immutable_config(env)
+    }
+
+    /// Configure whether the stream allows sender cancellation (Issue #685).
+    pub fn set_stream_config(env: Env, caller: Address, config: StreamConfig) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            ttl::bump(env);
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+            require_sender_or_operator(env, &caller, &info.sender)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::StreamConfig, &config);
+            Ok(())
+        })
+    }
+
+    /// Helper to set stream cancelability (Issue #685).
+    pub fn set_cancelable(env: Env, caller: Address, is_cancelable: bool) -> Result<(), Error> {
+        Self::set_stream_config(env, caller, StreamConfig { is_cancelable })
+    }
+
+    /// Read-only: get the configured stream cancellation config, if any (Issue #685).
+    pub fn stream_config(env: Env) -> Option<StreamConfig> {
+        env.storage().instance().get(&DataKey::StreamConfig)
+    }
+
+    /// Read-only: returns whether the stream allows sender cancellation (defaults to true) (Issue #685).
+    pub fn is_cancelable(env: Env) -> bool {
+        if let Some(cfg) = env
+            .storage()
+            .instance()
+            .get::<_, StreamConfig>(&DataKey::StreamConfig)
+        {
+            cfg.is_cancelable
+        } else {
+            true
+        }
     }
 }

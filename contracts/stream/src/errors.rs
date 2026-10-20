@@ -28,4 +28,16 @@ pub enum Error {
     BackdatedStream = 20,
     /// The stream has accrued tokens but is not funded enough to cover the requested withdrawal.
     StreamUnderfunded = 21,
+    /// The requested withdrawal violates the minimum interval rate limit.
+    WithdrawalTooFrequent = 22,
+    /// The stream is under an emergency administrative halt (Issue #699).
+    ContractPaused = 23,
+    /// The stream is non-cancelable (Issue #685).
+    StreamNotCancelable = 24,
+    /// The stream cannot be created with a zero rate per second.
+    ZeroRateStreamNotAllowed = 25,
+    /// A bounded stream is shorter than `MIN_STREAM_DURATION`.
+    StreamDurationTooShort = 26,
+    /// The optional human-readable description exceeds 128 bytes.
+    DescriptionTooLong = 27,
 }

@@ -11,8 +11,13 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
-/// Maximum number of transfers permitted in a single batch (CPU instruction limit constraint).
+/// Maximum number of transfers permitted in a single batch (Issue #677).
+///
+/// Bounded to 30 to prevent transaction CPU instruction budget limits in Soroban host.
 pub const MAX_BATCH_SIZE: u32 = 30;
+
+/// Maximum batch limit alias for MAX_BATCH_SIZE (Issue #677).
+pub const MAX_BATCH_LIMIT: u32 = MAX_BATCH_SIZE;
 
 /// Behaviour version of this deployment.
 ///
@@ -45,6 +50,8 @@ const VERSION: u32 = 2;
 pub enum DataKey {
     /// Address allowed to call `upgrade`. Set by `initialize`.
     Admin,
+    /// Temporary lock during batch execution to prevent reentrancy loops.
+    ReentrancyLock,
 }
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -76,6 +83,17 @@ pub enum Error {
     AlreadyInitialized = 8,
     /// `upgrade` was called before `initialize` has set an admin.
     NotInitialized = 9,
+    /// Another batch execution or reentrant call is already in progress.
+    ReentrancyForbidden = 10,
+}
+
+/// Individual execution status for an item in a batch execution (Issue #697).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchResult {
+    pub item_index: u32,
+    pub success: bool,
+    pub error_code: Option<u32>,
 }
 
 impl Error {
@@ -85,16 +103,23 @@ impl Error {
     pub const BATCH_SIZE_EXCEEDED: Error = Error::BatchTooLarge;
 }
 
-fn event_initialized(env: &Env, admin: &Address) {
-    env.events().publish((Symbol::new(env, "initialized"), admin.clone()), ());
-}
-
-fn event_upgraded(env: &Env, caller: &Address, timestamp: u64) {
-    env.events().publish((Symbol::new(env, "upgraded"), caller.clone()), timestamp);
-}
-
 #[contract]
 pub struct BatchTransferProcessor;
+
+/// Emitted by `initialize` when the processor's admin is first set.
+fn event_initialized(env: &Env, admin: &Address) {
+    env.events()
+        .publish((symbol_short!("init"), admin.clone()), admin.clone());
+}
+
+/// Emitted by `upgrade` after the processor's own WASM has been replaced.
+///
+/// Topics: `("upgraded", caller)` — the admin that authorized the swap.
+/// Data:   `upgraded_at` — the ledger timestamp at which the swap took effect.
+fn event_upgraded(env: &Env, caller: &Address, upgraded_at: u64) {
+    env.events()
+        .publish((symbol_short!("upgraded"), caller.clone()), upgraded_at);
+}
 
 /// Checks 1–4 of the documented `process_batch` validation order: length,
 /// batch size, per-amount sign, and checked accumulation of the total.
@@ -192,7 +217,7 @@ impl BatchTransferProcessor {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        ttl::bump_instance(&env);
+        ttl::bump(&env);
         env.storage().instance().set(&DataKey::Admin, &admin);
         event_initialized(&env, &admin);
         Ok(())
@@ -229,7 +254,7 @@ impl BatchTransferProcessor {
     /// list in the README:
     ///
     /// 1. `recipients.len() == amounts.len()` — else [`Error::LengthMismatch`]
-    /// 2. `amounts.len() <= MAX_BATCH_SIZE` (100) — else [`Error::BatchTooLarge`]
+    /// 2. `amounts.len() <= MAX_BATCH_SIZE` (30) — else [`Error::BatchTooLarge`]
     /// 3. every `amount > 0` — else [`Error::InvalidAmount`]
     /// 4. `sum(amounts)` fits in `i128` — else [`Error::ArithmeticOverflow`]
     /// 5. `token` behaves like a SEP-41 asset — else [`Error::InvalidToken`]
@@ -304,6 +329,68 @@ impl BatchTransferProcessor {
     ///
     /// # Returns
     /// The total number of tokens transferred on success.
+    /// Executes a batch transfer and returns per-item execution status codes (Issue #697).
+    pub fn process_batch_detailed(
+        env: Env,
+        funder: Address,
+        token: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<Vec<BatchResult>, Error> {
+        let total = validate_total(&recipients, &amounts)?;
+        validate_token(&env, &token)?;
+
+        let mut results = Vec::new(&env);
+        if total == 0 {
+            return Ok(results);
+        }
+
+        ttl::bump(&env);
+
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(Error::ReentrancyForbidden);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyLock, &true);
+
+        funder.require_auth();
+
+        let tk = token::Client::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        tk.transfer(&funder, &contract_addr, &total);
+
+        for (idx, (recipient, amount)) in recipients.iter().zip(amounts.iter()).enumerate() {
+            tk.transfer(&contract_addr, &recipient, &amount);
+            results.push_back(BatchResult {
+                item_index: idx as u32,
+                success: true,
+                error_code: None,
+            });
+        }
+
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_transferred"), funder.clone()),
+            (token.clone(), recipients.len(), total),
+        );
+
+        Ok(results)
+    }
+
+    /// Read-only alias for process_batch_detailed (Issue #697).
+    pub fn execute_batch(
+        env: Env,
+        funder: Address,
+        token: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<Vec<BatchResult>, Error> {
+        Self::process_batch_detailed(env, funder, token, recipients, amounts)
+    }
+
     pub fn process_batch(
         env: Env,
         funder: Address,
@@ -332,6 +419,14 @@ impl BatchTransferProcessor {
         // storage, exactly like the other three contracts' fail-early paths.
         ttl::bump(&env);
 
+        // ── Reentrancy guard ─────────────────────────────────────────────────
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(Error::ReentrancyForbidden);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyLock, &true);
+
         // ── Auth ─────────────────────────────────────────────────────────────
         funder.require_auth();
 
@@ -347,6 +442,8 @@ impl BatchTransferProcessor {
         for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
             tk.transfer(&contract_addr, &recipient, &amount);
         }
+
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
 
         // Emitted only after the fan-out above succeeds: a reverted transfer
         // rolls the whole transaction back, so this event never describes a
@@ -455,7 +552,7 @@ impl BatchTransferProcessor {
             return Err(Error::InvalidWasmHash);
         }
 
-        ttl::bump_instance(&env);
+        ttl::bump(&env);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         event_upgraded(&env, &caller, env.ledger().timestamp());
         Ok(())

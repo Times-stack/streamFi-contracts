@@ -62,22 +62,94 @@ async function acquireSingletonLock(pool: Pool): Promise<PoolClientWithLock> {
     process.exit(1);
   });
 
-  // Also handle advisory lock release on graceful shutdown.
-  const releaseAndExit = async (signal: string) => {
-    console.log(`[worker] Received ${signal}, releasing advisory lock and exiting...`);
-    try {
-      await client.query("SELECT pg_advisory_unlock($1)", [INDEXER_ADVISORY_LOCK_KEY]);
-    } catch {
-      // best-effort — the lock releases automatically when the session closes anyway
-    }
-    client.release();
-    await pool.end();
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => void releaseAndExit("SIGTERM"));
-  process.on("SIGINT", () => void releaseAndExit("SIGINT"));
+
 
   return client as PoolClientWithLock;
+}
+
+export interface GracefulShutdownOptions {
+  pool: Pool;
+  lockClient: PoolClientWithLock;
+  abortController: AbortController;
+  getPollLoopPromise?: () => Promise<unknown> | undefined;
+}
+
+/**
+ * Registers signal handlers for SIGTERM and SIGINT to gracefully shut down the worker.
+ * Waits for any current in-flight batch to finish before releasing advisory lock,
+ * ending the database pool, and exiting with code 0.
+ */
+export function setupGracefulShutdown(
+  pool: Pool,
+  lockClient: PoolClientWithLock,
+  abortController: AbortController,
+  getPollLoopPromise?: () => Promise<unknown> | undefined
+): (signal?: string) => Promise<void> {
+  let isShuttingDown = false;
+
+  const handleShutdown = async (signal = "SIGTERM") => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    console.log(`[worker] Received ${signal}, completing current batch before shutdown...`);
+    abortController.abort();
+
+    try {
+      const loopPromise = getPollLoopPromise?.();
+      if (loopPromise) {
+        await loopPromise;
+      }
+    } catch (err) {
+      console.error("[worker] Error while awaiting current batch during shutdown:", err);
+    }
+
+    console.log("[worker] Current batch completed. Releasing advisory lock...");
+    try {
+      await lockClient.query("SELECT pg_advisory_unlock($1)", [INDEXER_ADVISORY_LOCK_KEY]);
+    } catch {
+      // best-effort
+    }
+    try {
+      lockClient.release();
+    } catch {
+      // best-effort
+    }
+    try {
+      await pool.end();
+    } catch {
+      // best-effort
+    }
+    console.log("[worker] Graceful shutdown complete, exiting.");
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => void handleShutdown("SIGTERM"));
+  process.on("SIGINT", () => void handleShutdown("SIGINT"));
+
+  return handleShutdown;
+}
+
+/**
+ * One-time loud warning that this worker is running the placeholder event
+ * source (issue #568). `npm run start:worker` used to boot cleanly, log
+ * nothing at all, and index nothing forever — an operator could not tell
+ * "intentionally running the stub" apart from "the RPC path is broken and
+ * returning zero events". This line makes the difference visible once per
+ * process; silence afterwards means "no new events on chain".
+ */
+let placeholderWarned = false;
+export function warnPlaceholderSourceOnce(): void {
+  if (placeholderWarned) return;
+  placeholderWarned = true;
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      msg: "using placeholder event source — no events will be indexed",
+      source: "fetchEventsFromRPC",
+      file: "indexer/src/worker.ts",
+      hint: "implement fetchEventsFromRPC (soroban-rpc getEvents) to index real events",
+    })
+  );
 }
 
 async function fetchEventsFromRPC(
@@ -87,12 +159,13 @@ async function fetchEventsFromRPC(
   // Placeholder — in production this would call Horizon / Soroban RPC
   // `getEvents` with startLedger/fromLedger and pagination.
   // For local dev without a running node it returns an empty page so the
-  // poller simply advances nothing and sleeps.
+  // poller simply advances nothing and sleeps — loudly (issue #568).
   //
   // Replace with:
   //   const rpc = new SorobanRpc.Server(RPC_URL);
   //   const resp = await rpc.getEvents({ startLedger: fromLedger, limit, filters: [...] });
   //   return resp.events.map(toRawEvent);
+  warnPlaceholderSourceOnce();
   void fromLedger;
   void limit;
   return [];
@@ -103,15 +176,30 @@ async function main(): Promise<void> {
 
   // Single-instance guard — must be first thing after pool creation, before
   // any cursor reads or event fetches.
-  await acquireSingletonLock(pool);
+  const lockClient = await acquireSingletonLock(pool);
+
+  const abortController = new AbortController();
+  // Holder: the shutdown handler registered below must be able to await the
+  // poll loop even though the loop hasn't started yet — a const holder keeps
+  // eslint's prefer-const happy without deferring the assignment.
+  const pollLoop: { promise?: Promise<void> } = {};
+
+  setupGracefulShutdown(pool, lockClient, abortController, () => pollLoop.promise);
 
   const fetchEvents: FetchEventsFn = fetchEventsFromRPC;
 
+  // Issue #568 — say it at boot, not only on first fetch: this worker runs
+  // the placeholder source and will not index anything until it's replaced.
+  warnPlaceholderSourceOnce();
+
   console.log("[worker] Starting poll loop...");
-  await startPollLoop(pool, fetchEvents, {
+  pollLoop.promise = startPollLoop(pool, fetchEvents, {
     intervalMs: Number(process.env.POLLER_INTERVAL_MS ?? 5000),
     limit: Number(process.env.POLLER_PAGE_LIMIT ?? 100),
+    signal: abortController.signal,
   });
+
+  await pollLoop.promise;
 }
 
 // Only run when executed directly (not when imported in tests).
@@ -123,3 +211,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }
 
 export { acquireSingletonLock, fetchEventsFromRPC };
+

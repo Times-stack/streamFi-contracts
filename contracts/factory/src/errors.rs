@@ -61,4 +61,13 @@ pub enum Error {
     /// governor, which would leave every `create_stream` call pointing at a
     /// non-existent governor contract.
     InvalidGovernor = 31,
+    /// The salt used for deploying the stream contract has already been used.
+    SaltAlreadyUsed = 32,
+    /// `cancel_batch_streams` was called with duplicate stream addresses (Issue #787).
+    DuplicateStreamId = 33,
+    /// The optional stream description exceeds 128 bytes (#845).
+    DescriptionTooLong = 34,
+    /// Invalid factory initialization parameters (Issue #770).
+    /// Indicates misconfigured factory setup (e.g., invalid fee recipient, bounds).
+    InvalidFactoryConfiguration = 35,
 }

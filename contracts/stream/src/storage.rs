@@ -12,6 +12,8 @@ pub const FLAG_PAUSED: u32 = 1;
 pub const FLAG_CLAWBACK_ENABLED: u32 = 1 << 1;
 #[doc(hidden)]
 pub const FLAG_CANCELLED: u32 = 1 << 2;
+#[doc(hidden)]
+pub const FLAG_REGULATED_ASSET: u32 = 1 << 3;
 
 /// Current storage layout version for this contract.
 /// Bump this and add an explicit migration check whenever a future
@@ -47,6 +49,109 @@ pub enum DataKey {
     /// path free of cross-contract calls; a stream deployed directly
     /// (bypassing the factory) falls back to the historical 30-day default.
     ForceCancelPauseThresholdSecs,
+    /// Optional split configuration dividing claims between recipient and secondary recipient.
+    SplitConfig,
+    /// Optional cliff configuration with upfront unlock amount (Issue #719).
+    CliffConfig,
+    /// Configurable minimum interval in seconds between consecutive withdrawals (Issue #693).
+    MinWithdrawalInterval,
+    /// Timestamp of the last withdrawal.
+    LastWithdrawalTime,
+    /// Optional accrual checkpoint created by `change_rate`.
+    ///
+    /// Kept outside `StreamInfo` so adding rate changes does not alter the
+    /// serialized `Config` layout of already-deployed streams.
+    RateCheckpoint,
+    /// Emergency pause flag adhering to drip_common::pause (Issue #699).
+    EmergencyPaused,
+    /// Immutable stream configuration in instance storage (Issue #702).
+    ImmutableConfig,
+    /// Milestone flag indicating the cliff timestamp was passed and event emitted (Issue #676).
+    CliffReached,
+    /// Milestone flag indicating the stream has fully settled and completion event emitted (Issue #676).
+    StreamCompleted,
+    /// Stream cancellation configuration (Issue #685).
+    StreamConfig,
+    /// Optional stream title updated post-creation by sender.
+    /// Allows sender to rename or describe the stream.
+    StreamTitle,
+    /// Optional reference tag (e.g. invoice, order, or external ID).
+    /// Allows sender to link the stream to external systems.
+    ReferenceTag,
+    /// Optional human-readable description set at creation (#845).
+    StreamDescription,
+}
+
+/// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImmutableConfig {
+    pub start_time: u64,
+    pub stop_time: u64,
+    pub token: Address,
+    pub rate_per_second: i128,
+    pub sender: Address,
+    pub recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitConfig {
+    pub secondary_recipient: Address,
+    pub split_bps: u32,
+}
+
+/// Stream configuration including cliff and upfront unlock parameters (Issue #719).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CliffConfig {
+    pub cliff_time: u64,
+    pub cliff_unlock_amount: i128,
+}
+
+/// Accrued-value checkpoint used to make rate changes prospective.
+///
+/// `accrued` is the total amount earned at `at`. From that point onward
+/// streaming uses the current `StreamInfo::rate_per_second`. For a pending
+/// stream (or a stream still before its cliff), `at` may be in the future;
+/// no value is considered streamed until that timestamp is reached.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateCheckpoint {
+    pub accrued: i128,
+    pub at: u64,
+}
+
+/// Stream cancellation configuration (Issue #685).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamConfig {
+    pub is_cancelable: bool,
+}
+
+/// Operational status of a stream.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamStatus {
+    Pending = 0,
+    Active = 1,
+    Paused = 2,
+    Cancelled = 3,
+    Completed = 4,
+}
+
+/// Consolidated state summary for a stream.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamSummary {
+    pub sender: Address,
+    pub recipient: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub streamed_amount: i128,
+    pub status: StreamStatus,
+    pub start_time: u64,
+    pub stop_time: u64,
 }
 
 #[contracttype]
@@ -62,6 +167,7 @@ pub struct StreamInfo {
     pub paused_at: u64,
     pub flags: u32,
     pub event_sequence: u64,
+    pub cumulative_fees: i128,
 }
 
 impl StreamInfo {
@@ -80,8 +186,18 @@ impl StreamInfo {
         (self.flags & FLAG_CLAWBACK_ENABLED) != 0
     }
 
+    /// True when the `FLAG_REGULATED_ASSET` bit (0x08) is set in `flags` (Issue #781).
+    pub fn is_regulated_asset(&self) -> bool {
+        (self.flags & FLAG_REGULATED_ASSET) != 0
+    }
+
     /// Mark the stream as cancelled, setting the correct flag bit.
     pub fn mark_cancelled(&mut self) {
         self.flags |= FLAG_CANCELLED;
+    }
+
+    /// Mark the stream as using a regulated asset, setting the correct flag bit (Issue #781).
+    pub fn mark_regulated_asset(&mut self) {
+        self.flags |= FLAG_REGULATED_ASSET;
     }
 }

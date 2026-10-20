@@ -27,4 +27,18 @@ pub enum Error {
     NotPendingAuthority = 11,
     /// The WASM hash provided to `upgrade` is all zeros (invalid).
     InvalidWasmHash = 12,
+    /// Proposal not found.
+    ProposalNotFound = 13,
+    /// Proposal has expired (execution window elapsed).
+    ProposalExpired = 14,
+    /// Proposal has already been executed or cancelled.
+    ProposalNotPending = 15,
+    /// Minimum timelock delay has not elapsed since proposal creation.
+    TimelockNotMet = 16,
+    /// Quorum threshold not met for proposal execution.
+    QuorumNotMet = 17,
+    /// Voter has already cast a vote on this proposal.
+    AlreadyVoted = 18,
+    /// Voter had zero checkpointed voting weight at the proposal's snapshot ledger.
+    InsufficientVotingWeight = 19,
 }

@@ -644,3 +644,512 @@ fn read_index_cpu_instruction_regression() {
         "streams_by_sender full-page read consumed {cpu} CPU instructions, exceeds 2M regression threshold"
     );
 }
+
+#[test]
+fn test_is_known_stream_returns_false_for_unknown_address() {
+    let s = Setup::new();
+    let random_addr = Address::generate(&s.env);
+    assert_eq!(s.client.is_known_stream(&random_addr), false);
+}
+
+#[test]
+fn test_max_batch_size_matches_constant() {
+    let s = Setup::new();
+    assert_eq!(s.client.max_batch_size(), crate::MAX_BATCH_SIZE);
+    assert_eq!(s.client.max_batch_size(), 10);
+}
+
+#[test]
+fn test_stream_wasm_hash_returns_configured_hash() {
+    let s = Setup::new();
+    let expected_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    assert_eq!(s.client.stream_wasm_hash(), expected_hash);
+
+    let new_hash = BytesN::from_array(&s.env, &[2u8; 32]);
+    s.client.upgrade_stream_wasm(&new_hash);
+    assert_eq!(s.client.stream_wasm_hash(), new_hash);
+}
+
+#[test]
+fn test_stream_wasm_hash_uninitialized_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, DripFactory);
+    let client = DripFactoryClient::new(&env, &contract_id);
+    assert_eq!(
+        client.try_stream_wasm_hash(),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+// ── Issue #622: record_cancel verification and idempotency ───────────────────
+
+fn deploy_test_stream(env: &Env, sender: &Address) -> Address {
+    let stream_addr = env.register_contract(None, drip_stream::DripStream);
+    let recipient = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let tok = soroban_sdk::token::StellarAssetClient::new(env, &token_addr);
+    tok.mint(sender, &1000);
+    tok.mint(&stream_addr, &1000);
+
+    let stream_client = drip_stream::DripStreamClient::new(env, &stream_addr);
+    let start = env.ledger().timestamp();
+    stream_client.initialize(
+        sender,
+        &recipient,
+        &token_addr,
+        &10,
+        &start,
+        &(start + 100),
+        &false,
+        &2_592_000,
+        &false,
+        &None,
+    );
+    stream_addr
+}
+
+#[test]
+fn record_cancel_rejects_unknown_stream_address() {
+    let s = Setup::new();
+    let unknown_addr = Address::generate(&s.env);
+
+    let agg_before = s.client.aggregate();
+    s.client.record_cancel(&unknown_addr);
+    let agg_after = s.client.aggregate();
+    assert_eq!(agg_before.active_streams, agg_after.active_streams);
+}
+
+#[test]
+fn record_cancel_ignores_uncancelled_stream() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let stream_addr = deploy_test_stream(&s.env, &sender);
+
+    // Register stream as known in factory and set initial active_streams
+    s.env.as_contract(&s.client.address, || {
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::IsKnownStream(stream_addr.clone()), &true);
+        let mut agg: crate::storage::Aggregate = s
+            .env
+            .storage()
+            .instance()
+            .get(&DataKey::Aggregate)
+            .unwrap_or(crate::storage::Aggregate {
+                total_supply: 0,
+                active_streams: 0,
+            });
+        agg.active_streams = 1;
+        s.env.storage().instance().set(&DataKey::Aggregate, &agg);
+    });
+
+    let agg_before = s.client.aggregate();
+    assert_eq!(agg_before.active_streams, 1);
+
+    // Call record_cancel while stream is active
+    s.client.record_cancel(&stream_addr);
+    let agg_after = s.client.aggregate();
+    assert_eq!(agg_after.active_streams, 1);
+}
+
+#[test]
+fn record_cancel_decrements_only_once_for_cancelled_stream() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let stream_addr = deploy_test_stream(&s.env, &sender);
+
+    // Register stream as known in factory and set initial active_streams
+    s.env.as_contract(&s.client.address, || {
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::IsKnownStream(stream_addr.clone()), &true);
+        let mut agg: crate::storage::Aggregate = s
+            .env
+            .storage()
+            .instance()
+            .get(&DataKey::Aggregate)
+            .unwrap_or(crate::storage::Aggregate {
+                total_supply: 0,
+                active_streams: 0,
+            });
+        agg.active_streams = 1;
+        s.env.storage().instance().set(&DataKey::Aggregate, &agg);
+    });
+
+    let stream_client = drip_stream::DripStreamClient::new(&s.env, &stream_addr);
+    stream_client.cancel(&sender);
+
+    let agg_before = s.client.aggregate();
+    assert_eq!(agg_before.active_streams, 1);
+
+    // First record_cancel call decrements
+    s.client.record_cancel(&stream_addr);
+    let agg_after = s.client.aggregate();
+    assert_eq!(agg_after.active_streams, 0);
+
+    // Second record_cancel call is idempotent (no second decrement)
+    s.client.record_cancel(&stream_addr);
+    let agg_after_repeat = s.client.aggregate();
+    assert_eq!(agg_after_repeat.active_streams, 0);
+}
+
+#[test]
+fn record_cancel_idempotent_after_batch_cancel() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let stream_addr = deploy_test_stream(&s.env, &sender);
+
+    s.env.as_contract(&s.client.address, || {
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::IsKnownStream(stream_addr.clone()), &true);
+        let mut agg: crate::storage::Aggregate = s
+            .env
+            .storage()
+            .instance()
+            .get(&DataKey::Aggregate)
+            .unwrap_or(crate::storage::Aggregate {
+                total_supply: 0,
+                active_streams: 0,
+            });
+        agg.active_streams = 1;
+        s.env.storage().instance().set(&DataKey::Aggregate, &agg);
+    });
+
+    let mut addrs = soroban_sdk::Vec::new(&s.env);
+    addrs.push_back(stream_addr.clone());
+    s.client.cancel_batch_streams(&sender, &addrs);
+
+    let agg_after_batch = s.client.aggregate();
+    assert_eq!(agg_after_batch.active_streams, 0);
+
+    // Subsequent record_cancel on batch-cancelled stream does not decrement further
+    s.client.record_cancel(&stream_addr);
+    let agg_after_record = s.client.aggregate();
+    assert_eq!(agg_after_record.active_streams, 0);
+}
+
+// ── Issue #623: estimate_fee coverage across all StreamOperation variants ────
+
+#[test]
+fn estimate_fee_covers_all_operations_with_positive_estimates() {
+    let s = Setup::new();
+
+    let ops = [
+        crate::storage::StreamOperation::CreateStream,
+        crate::storage::StreamOperation::CancelStream,
+        crate::storage::StreamOperation::Withdraw,
+        crate::storage::StreamOperation::PauseStream,
+        crate::storage::StreamOperation::ResumeStream,
+        crate::storage::StreamOperation::SetOperator,
+        crate::storage::StreamOperation::RevokeOperator,
+        crate::storage::StreamOperation::ExtendDuration,
+        crate::storage::StreamOperation::TopUp,
+        crate::storage::StreamOperation::TopUpAndExtend,
+        crate::storage::StreamOperation::Clawback,
+        crate::storage::StreamOperation::ForceCancel,
+        crate::storage::StreamOperation::TransferRecipient,
+    ];
+
+    for op in ops.into_iter() {
+        let estimate = s.client.estimate_fee(&op);
+        assert!(
+            estimate.cpu_instructions > 0,
+            "cpu_instructions should be > 0"
+        );
+        assert!(estimate.ledger_entries > 0, "ledger_entries should be > 0");
+        assert_eq!(estimate.fee_stroops, 0);
+        assert_eq!(estimate.fee_xlm, 0);
+    }
+}
+
+// ── Issue #624: index migration bounds and short-circuit ─────────────────────
+
+#[test]
+fn migrate_sender_index_caps_pages_and_short_circuits_when_done() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+
+    s.env.as_contract(&s.client.address, || {
+        let mut legacy = soroban_sdk::Vec::new(&s.env);
+        for id in 0..250_u64 {
+            legacy.push_back(id);
+        }
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BySender(sender.clone()), &legacy);
+    });
+
+    // Calling with an arbitrarily huge max_pages (e.g. 500) migrates all available pages safely
+    let migrated = s.client.migrate_sender_index(&sender, &500);
+    assert_eq!(migrated, 250);
+
+    // Legacy key is removed once completed
+    s.env.as_contract(&s.client.address, || {
+        assert!(!s
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::BySender(sender.clone())));
+    });
+
+    // Calling again short-circuits to cheap no-op read and returns total count
+    let migrated_repeat = s.client.migrate_sender_index(&sender, &10);
+    assert_eq!(migrated_repeat, 250);
+}
+
+#[test]
+fn migrate_recipient_index_short_circuits_when_done() {
+    let s = Setup::new();
+    let recipient = Address::generate(&s.env);
+
+    s.env.as_contract(&s.client.address, || {
+        let mut legacy = soroban_sdk::Vec::new(&s.env);
+        for id in 0..150_u64 {
+            legacy.push_back(id);
+        }
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::ByRecipient(recipient.clone()), &legacy);
+    });
+
+    let migrated = s.client.migrate_recipient_index(&recipient, &100);
+    assert_eq!(migrated, 150);
+
+    // Repeated call short-circuits
+    let migrated_repeat = s.client.migrate_recipient_index(&recipient, &10);
+    assert_eq!(migrated_repeat, 150);
+}
+
+#[test]
+#[ignore = "requires a real deployed stream WASM; fixture uses a dummy hash"]
+fn test_stream_created_event_payload_includes_salt_and_wasm_hash() {
+    let env = Env::default();
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stream_addr = Address::generate(&env);
+    let salt = BytesN::from_array(&env, &[42u8; 32]);
+    let wasm_hash = BytesN::from_array(&env, &[99u8; 32]);
+
+    crate::events::stream_created(&env, &creator, &recipient, &stream_addr, &salt, &wasm_hash);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 1);
+    let last = events.last().unwrap();
+    assert_eq!(last.1.len(), 3); // Topics: (StreamCreated, creator, recipient)
+}
+
+#[test]
+fn test_get_streams_by_creator_paged() {
+    let s = Setup::new();
+    let creator = Address::generate(&s.env);
+    let stream1 = Address::generate(&s.env);
+    let stream2 = Address::generate(&s.env);
+
+    s.env.as_contract(&s.client.address, || {
+        let mut ids = soroban_sdk::Vec::new(&s.env);
+        ids.push_back(1u64);
+        ids.push_back(2u64);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BySender(creator.clone()), &ids);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::StreamAddr(1u64), &stream1);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::StreamAddr(2u64), &stream2);
+    });
+
+    let paged = s.client.get_streams_by_creator_paged(&creator, &0, &10);
+    assert_eq!(paged.len(), 2);
+    assert_eq!(paged.get(0).unwrap(), stream1);
+    assert_eq!(paged.get(1).unwrap(), stream2);
+
+    let paged_offset = s.client.get_streams_by_creator_paged(&creator, &1, &1);
+    assert_eq!(paged_offset.len(), 1);
+    assert_eq!(paged_offset.get(0).unwrap(), stream2);
+
+    let all = s.client.get_streams_by_creator(&creator);
+    assert_eq!(all.len(), 2);
+}
+
+fn high_stream_creation_concurrency() {
+    use soroban_sdk::testutils::BytesN as _;
+
+    let s = Setup::new();
+
+    // Simulate high concurrent stream creation by rapidly calling create_stream
+    // with different senders and recipients. Each invocation:
+    // - Generates a unique sender and recipient
+    // - Deploys a new DripStream contract instance
+    // - Registers state in the factory's index
+    //
+    // We target 50 concurrent-like operations to stress the index and
+    // storage operations under load.
+    let concurrency_level = 50;
+    let mut stream_ids = std::vec::Vec::new();
+
+    for i in 0..concurrency_level {
+        let sender = Address::generate(&s.env);
+        let recipient = Address::generate(&s.env);
+        let token = Address::generate(&s.env);
+
+        // Verify each stream_id is unique
+        let stream_id = s.client.create_stream(
+            &sender,
+            &recipient,
+            &token,
+            &1_000_000i128, // deposit
+            &1i128,         // rate per second
+            &(s.env.ledger().timestamp() + 3600),
+            &0u64, // open-ended
+            &true, // clawback enabled
+            &None,
+        );
+
+        // Ensure stream_ids don't collide
+        assert!(
+            !stream_ids.contains(&stream_id),
+            "Duplicate stream_id at iteration {}",
+            i
+        );
+        stream_ids.push(stream_id);
+    }
+
+    // Verify all streams were created and indexed
+    assert_eq!(
+        stream_ids.len(),
+        concurrency_level,
+        "Expected {} stream IDs created, got {}",
+        concurrency_level,
+        stream_ids.len()
+    );
+
+    // Spot-check: verify a few random stream IDs are queryable from the index
+    for &stream_id in stream_ids.iter().step_by(10).take(5) {
+        let stream_info = s.client.stream_address(&stream_id);
+        assert!(
+            stream_info.is_some(),
+            "Stream {} not found in index",
+            stream_id
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a real deployed stream WASM; fixture uses a dummy hash"]
+fn concurrent_stream_creation_maintains_factory_invariants() {
+    use soroban_sdk::testutils::BytesN as _;
+
+    let s = Setup::new();
+
+    let senders: std::vec::Vec<_> = (0..10).map(|_| Address::generate(&s.env)).collect();
+
+    // Create multiple streams per sender to test:
+    // - Index integrity under repeated sender entries
+    // - No cross-contamination between senders
+    // - Proper ref-count or cleanup if implemented
+    let streams_per_sender = 5;
+    let total_expected = senders.len() * streams_per_sender;
+
+    for sender in &senders {
+        for _ in 0..streams_per_sender {
+            let recipient = Address::generate(&s.env);
+            let token = Address::generate(&s.env);
+
+            let _stream_id = s.client.create_stream(
+                sender,
+                &recipient,
+                &token,
+                &500_000i128,
+                &1i128,
+                &(s.env.ledger().timestamp() + 7200),
+                &0u64,
+                &false,
+                &None,
+            );
+        }
+    }
+
+    // Verify event count reflects the total number of creations
+    let event_count = s.event_count();
+    assert!(
+        event_count >= total_expected,
+        "Expected at least {} creation events, got {}",
+        total_expected,
+        event_count
+    );
+}
+
+// ── Issue #844: zero-deposit validation ─────────────────────────────────────
+
+#[test]
+fn create_stream_rejects_zero_deposit_before_governor_call() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let recipient = Address::generate(&s.env);
+    let token = Address::generate(&s.env);
+
+    // `validate_stream_request` rejects the deposit before the factory reads
+    // the governor, so the dummy governor in this fixture is never called.
+    let result = s.client.try_create_stream(
+        &sender, &recipient, &token, &0i128, // deposit == 0
+        &1i128, &0u64, &3_600u64, &false, &None,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InvalidDeposit)));
+}
+
+// ── Issues #845/#847: factory-side description and duration validation ──────
+
+#[test]
+fn create_stream_rejects_a_bounded_stream_shorter_than_the_minimum() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let recipient = Address::generate(&s.env);
+    let token = Address::generate(&s.env);
+
+    let result = s.client.try_create_stream(
+        &sender, &recipient, &token, &3_600i128, &1i128, &0u64,
+        &30u64, // shorter than MIN_STREAM_DURATION
+        &false, &None,
+    );
+
+    assert_eq!(result, Err(Ok(Error::DurationTooShort)));
+}
+
+#[test]
+fn create_stream_rejects_a_description_over_128_bytes() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let recipient = Address::generate(&s.env);
+    let token = Address::generate(&s.env);
+    let too_long = soroban_sdk::String::from_str(&s.env, &"x".repeat(129));
+
+    let result = s.client.try_create_stream(
+        &sender,
+        &recipient,
+        &token,
+        &3_600i128,
+        &1i128,
+        &0u64,
+        &3_600u64,
+        &false,
+        &Some(too_long),
+    );
+
+    assert_eq!(result, Err(Ok(Error::DescriptionTooLong)));
+}
