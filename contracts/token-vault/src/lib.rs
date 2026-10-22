@@ -259,6 +259,7 @@ impl TokenVault {
             let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             let balance = vault_balance(&env)?;
             let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            if !is_token_approved(&env, &default_token) { return Err(Error::TokenNotApproved); }
             if !check_vault_balance(&env, &default_token, balance) {
                 return Err(Error::VaultBalanceChanged);
             }
@@ -347,6 +348,7 @@ impl TokenVault {
 
             let balance = vault_balance(&env)?;
             let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            if !is_token_approved(&env, &default_token) { return Err(Error::TokenNotApproved); }
             if !check_vault_balance(&env, &default_token, balance) {
                 return Err(Error::VaultBalanceChanged);
             }
@@ -684,6 +686,7 @@ impl TokenVault {
     /// the owner to re-open the contract or submit a `RestoreFootprint`.
     pub fn keep_alive(env: Env) -> Result<(), Error> {
         bump_instance(&env);
+        ttl::bump_all_vault_keys(&env);
         events::kept_alive(&env, TTL_EXTEND_TO);
         Ok(())
     }
@@ -935,6 +938,7 @@ impl TokenVault {
             if amount <= 0 { return Err(Error::InvalidAmount); }
             if amount > MAX_VAULT_DEPOSIT { return Err(Error::DepositExceedsMax); }
             let token = get_token(&env).ok_or(Error::NotInitialized)?;
+            if !is_token_approved(&env, &token) { return Err(Error::TokenNotApproved); }
             let tk = token::Client::new(&env, &token);
             let before = tk.balance(&env.current_contract_address());
             if !check_vault_balance(&env, &token, before) {
