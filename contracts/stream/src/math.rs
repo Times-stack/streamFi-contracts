@@ -102,6 +102,15 @@ pub fn calculate_streamed_amount(rate_per_second: i128, elapsed: u64) -> Result<
         .ok_or(Error::ArithmeticOverflow)
 }
 
+/// Safely calculates rate × duration with saturating arithmetic to prevent overflow (Issue #749).
+/// Saturates at i128::MAX if the result exceeds the maximum value.
+pub fn rate_duration_saturating(rate_per_second: i128, duration: u64) -> i128 {
+    if rate_per_second == 0 || duration == 0 {
+        return 0;
+    }
+    rate_per_second.saturating_mul(duration as i128)
+}
+
 /// Returns tokens available for the recipient to withdraw right now.
 ///
 /// Computed as `streamed_amount(env, info) - info.withdrawn`, so it inherits
@@ -202,5 +211,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_rate_duration_saturating_zero_cases() {
+        // Zero rate or duration returns 0
+        assert_eq!(rate_duration_saturating(0, 100), 0);
+        assert_eq!(rate_duration_saturating(500, 0), 0);
+        assert_eq!(rate_duration_saturating(0, 0), 0);
+    }
+
+    #[test]
+    fn test_rate_duration_saturating_normal_ranges() {
+        // Normal ranges compute correctly
+        assert_eq!(rate_duration_saturating(10, 5), 50);
+        assert_eq!(rate_duration_saturating(1_000_000, 3600), 3_600_000_000);
+    }
+
+    #[test]
+    fn test_rate_duration_saturating_overflow_behavior() {
+        // Overflow saturates to i128::MAX instead of panicking
+        assert_eq!(rate_duration_saturating(i128::MAX, 2), i128::MAX);
+        assert_eq!(rate_duration_saturating(i128::MAX, u64::MAX), i128::MAX);
+        assert_eq!(rate_duration_saturating(1_000_000_000_000, u64::MAX), i128::MAX);
+    }
+
+    #[test]
+    fn test_rate_duration_saturating_boundary() {
+        // Test exact boundary at i128::MAX
+        assert_eq!(rate_duration_saturating(i128::MAX, 1), i128::MAX);
+
+        // Test half of max
+        let half_max = i128::MAX / 2;
+        assert_eq!(rate_duration_saturating(half_max, 2), half_max.saturating_mul(2));
+        // With 3, it would overflow to max
+        assert_eq!(rate_duration_saturating(half_max, 3), i128::MAX);
     }
 }

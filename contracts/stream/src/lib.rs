@@ -22,6 +22,10 @@ use storage::{
 /// Minimum duration for a bounded stream, in seconds (#847).
 pub const MIN_STREAM_DURATION: u64 = 60;
 
+/// Maximum duration for a bounded stream, in seconds (Issue #747).
+/// Set to 100 years (365.25 days × 100) to allow reasonable long-term streams.
+pub const MAX_STREAM_DURATION: u64 = 3_155_760_000;
+
 /// Maximum byte length of the optional human-readable description (#845).
 pub const MAX_DESCRIPTION_LEN: u32 = 128;
 
@@ -155,6 +159,13 @@ impl DripStream {
         // use `end_time == 0` as a sentinel and are unaffected.
         if end_time > 0 && end_time - start_time < MIN_STREAM_DURATION {
             panic_with_error!(&env, Error::StreamDurationTooShort);
+        }
+
+        // Enforce a reasonable maximum duration to prevent excessively long
+        // streams that could lock tokens for impractical durations (Issue #747).
+        // Open-ended streams (`end_time == 0`) are unaffected.
+        if end_time > 0 && end_time - start_time > MAX_STREAM_DURATION {
+            panic_with_error!(&env, Error::InvalidTimeRange);
         }
 
         if let Some(ref desc) = description {
@@ -1364,6 +1375,46 @@ impl DripStream {
     /// Read-only: the current reference tag, if set.
     pub fn reference_tag(env: Env) -> Option<String> {
         env.storage().instance().get(&DataKey::ReferenceTag)
+    }
+
+    /// Sender updates the stream's invoice metadata URI (Issue #748).
+    /// Stores a URI pointing to metadata associated with invoicing information.
+    pub fn set_invoice_metadata_uri(env: Env, caller: Address, uri: String) -> Result<(), Error> {
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::bump(&env);
+
+        env.storage().instance().set(&DataKey::InvoiceMetadataUri, &uri);
+        Ok(())
+    }
+
+    /// Sender updates the stream's milestone metadata URI (Issue #748).
+    /// Stores a URI pointing to metadata associated with milestone information.
+    pub fn set_milestone_metadata_uri(env: Env, caller: Address, uri: String) -> Result<(), Error> {
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::bump(&env);
+
+        env.storage().instance().set(&DataKey::MilestoneMetadataUri, &uri);
+        Ok(())
+    }
+
+    /// Read-only: the optional invoice metadata URI, if set (Issue #748).
+    pub fn invoice_metadata_uri(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::InvoiceMetadataUri)
+    }
+
+    /// Read-only: the optional milestone metadata URI, if set (Issue #748).
+    pub fn milestone_metadata_uri(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::MilestoneMetadataUri)
     }
 
     /// Read-only: total tokens streamed so far (regardless of withdrawals).
