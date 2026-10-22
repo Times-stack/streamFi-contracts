@@ -124,20 +124,20 @@ pub fn force_cancelled(
     );
 }
 
-pub fn paused(env: &Env, sender: &Address, paused_at: u64, withdrawable: i128) {
+pub fn paused(env: &Env, initiator: &Address, paused_at: u64, withdrawable: i128) {
     assert_non_negative_amount(env, withdrawable);
 
     let sequence = next_sequence(env);
     env.events().publish(
-        (symbol_short!("paused"), sender.clone(), sequence),
+        (symbol_short!("paused"), initiator.clone(), sequence),
         (paused_at, withdrawable),
     );
 }
 
-pub fn resumed(env: &Env, sender: &Address, resumed_at: u64) {
+pub fn resumed(env: &Env, initiator: &Address, resumed_at: u64) {
     let sequence = next_sequence(env);
     env.events().publish(
-        (symbol_short!("resumed"), sender.clone(), sequence),
+        (symbol_short!("resumed"), initiator.clone(), sequence),
         resumed_at,
     );
 }

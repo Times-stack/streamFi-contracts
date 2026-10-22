@@ -80,6 +80,10 @@ pub enum DataKey {
     ReferenceTag,
     /// Optional human-readable description set at creation (#845).
     StreamDescription,
+    /// Optional metadata URI for stream invoices (Issue #748).
+    InvoiceMetadataUri,
+    /// Optional metadata URI for stream milestones (Issue #748).
+    MilestoneMetadataUri,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).
