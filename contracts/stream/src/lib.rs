@@ -14,7 +14,9 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env,
 use drip_common::{is_zero_address, pause};
 
 pub use errors::Error;
-pub use storage::{CliffConfig, SplitConfig, StreamConfig, StreamStatus, StreamSummary};
+pub use storage::{
+    CliffConfig, SplitConfig, StreamConfig, StreamKeeperRewardPool, StreamStatus, StreamSummary,
+};
 use storage::{
     DataKey, RateCheckpoint, StreamInfo, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED, FLAG_REGULATED_ASSET,
 };
@@ -973,6 +975,232 @@ impl DripStream {
             return Ok(0);
         }
         math::withdrawable(&env, &info)
+    }
+
+    /// Configure the separately funded token pool used to reimburse keepers.
+    ///
+    /// Only the stream sender or its delegated operator can configure the
+    /// reward. The reward token must differ from the stream token so keeper
+    /// payouts cannot consume escrow intended for stream recipients.
+    pub fn configure_keeper_reward_pool(
+        env: Env,
+        caller: Address,
+        reward_token: Address,
+        reward_per_ping: i128,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            let info = state::load(env);
+            require_sender_or_operator(env, &caller, &info.sender)?;
+            state::assert_not_cancelled(&info)?;
+
+            if reward_per_ping <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            if is_zero_address(env, &reward_token) || reward_token == info.token {
+                return Err(Error::InvalidKeeperRewardToken);
+            }
+
+            let reward_token_client = token::Client::new(env, &reward_token);
+            if reward_token_client
+                .try_balance(&env.current_contract_address())
+                .is_err()
+            {
+                return Err(Error::InvalidKeeperRewardToken);
+            }
+
+            let existing: Option<StreamKeeperRewardPool> =
+                env.storage().instance().get(&DataKey::KeeperRewardPool);
+            let balance = match existing {
+                Some(pool) if pool.token != reward_token => {
+                    return Err(Error::InvalidKeeperRewardToken);
+                }
+                Some(pool) if pool.token == reward_token => pool.balance,
+                _ => 0,
+            };
+
+            ttl::bump(env);
+            env.storage().instance().set(
+                &DataKey::KeeperRewardPool,
+                &StreamKeeperRewardPool {
+                    token: reward_token.clone(),
+                    reward_per_ping,
+                    balance,
+                },
+            );
+            events::keeper_reward_pool_configured(env, &caller, &reward_token, reward_per_ping);
+            Ok(())
+        })
+    }
+
+    /// Fund the keeper reward pool from the authenticated sender or operator.
+    pub fn fund_keeper_reward_pool(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            let info = state::load(env);
+            require_sender_or_operator(env, &caller, &info.sender)?;
+            state::assert_not_cancelled(&info)?;
+
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            let mut pool: StreamKeeperRewardPool = env
+                .storage()
+                .instance()
+                .get(&DataKey::KeeperRewardPool)
+                .ok_or(Error::KeeperRewardPoolNotConfigured)?;
+            let new_pool_balance = pool
+                .balance
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let reward_token = token::Client::new(env, &pool.token);
+            let contract_address = env.current_contract_address();
+            let expected_token_balance = reward_token
+                .balance(&contract_address)
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            pool.balance = new_pool_balance;
+            env.storage()
+                .instance()
+                .set(&DataKey::KeeperRewardPool, &pool);
+            ttl::bump(env);
+            reward_token.transfer(&caller, &contract_address, &amount);
+            if reward_token.balance(&contract_address) != expected_token_balance {
+                return Err(Error::KeeperRewardTransferFailed);
+            }
+
+            events::keeper_reward_pool_funded(env, &caller, &pool.token, amount);
+            Ok(())
+        })
+    }
+
+    /// Withdraw unused keeper-pool funds to the authenticated sender or operator.
+    ///
+    /// This remains available after stream cancellation so any unused reward
+    /// balance does not become permanently inaccessible.
+    pub fn withdraw_keeper_reward_pool(
+        env: Env,
+        caller: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            let info = state::load(env);
+            require_sender_or_operator(env, &caller, &info.sender)?;
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            let mut pool: StreamKeeperRewardPool = env
+                .storage()
+                .instance()
+                .get(&DataKey::KeeperRewardPool)
+                .ok_or(Error::KeeperRewardPoolNotConfigured)?;
+            pool.balance = pool
+                .balance
+                .checked_sub(amount)
+                .ok_or(Error::InsufficientKeeperRewardPool)?;
+
+            let reward_token = token::Client::new(env, &pool.token);
+            let contract_address = env.current_contract_address();
+            let contract_balance = reward_token.balance(&contract_address);
+            let expected_balance = contract_balance
+                .checked_sub(amount)
+                .ok_or(Error::InsufficientKeeperRewardPool)?;
+            let expected_caller_balance = reward_token
+                .balance(&caller)
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            env.storage()
+                .instance()
+                .set(&DataKey::KeeperRewardPool, &pool);
+            ttl::bump(env);
+            reward_token.transfer(&contract_address, &caller, &amount);
+            if reward_token.balance(&contract_address) != expected_balance
+                || reward_token.balance(&caller) != expected_caller_balance
+            {
+                return Err(Error::KeeperRewardTransferFailed);
+            }
+
+            events::keeper_reward_pool_withdrawn(env, &caller, &pool.token, amount);
+            Ok(())
+        })
+    }
+
+    /// Read the configured keeper reward token, bounty, and remaining pool.
+    pub fn keeper_reward_pool(env: Env) -> Option<StreamKeeperRewardPool> {
+        env.storage().instance().get(&DataKey::KeeperRewardPool)
+    }
+
+    /// Extend this stream's instance TTL and pay its configured keeper bounty.
+    ///
+    /// A keeper may be reimbursed at most once per TTL threshold interval.
+    /// The bounty is paid from the stream's separately funded reward token,
+    /// never from the stream's escrow token.
+    pub fn keeper_ping(env: Env, keeper: Address) -> Result<i128, Error> {
+        state::with_guard(&env, |env| {
+            keeper.require_auth();
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+
+            let mut pool: StreamKeeperRewardPool = env
+                .storage()
+                .instance()
+                .get(&DataKey::KeeperRewardPool)
+                .ok_or(Error::KeeperRewardPoolNotConfigured)?;
+            if pool.balance < pool.reward_per_ping {
+                return Err(Error::InsufficientKeeperRewardPool);
+            }
+
+            let ledger = env.ledger().sequence();
+            let last_ping: Option<u32> =
+                env.storage().instance().get(&DataKey::LastKeeperPingLedger);
+            if last_ping
+                .map(|last| ledger < last.saturating_add(drip_common::ttl::MIN_TTL_LEDGERS))
+                .unwrap_or(false)
+            {
+                return Err(Error::KeeperPingTooFrequent);
+            }
+
+            let bounty_amount = pool.reward_per_ping;
+            pool.balance = pool
+                .balance
+                .checked_sub(bounty_amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::KeeperRewardPool, &pool);
+            env.storage()
+                .instance()
+                .set(&DataKey::LastKeeperPingLedger, &ledger);
+
+            let remaining_secs = if info.end_time > 0 {
+                info.end_time.saturating_sub(env.ledger().timestamp())
+            } else {
+                0
+            };
+            ttl::bump_for_remaining(env, remaining_secs);
+
+            let reward_token = token::Client::new(env, &pool.token);
+            let contract_address = env.current_contract_address();
+            let expected_balance = reward_token
+                .balance(&contract_address)
+                .checked_sub(bounty_amount)
+                .ok_or(Error::InsufficientKeeperRewardPool)?;
+            let expected_keeper_balance = reward_token
+                .balance(&keeper)
+                .checked_add(bounty_amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            reward_token.transfer(&contract_address, &keeper, &bounty_amount);
+            if reward_token.balance(&contract_address) != expected_balance
+                || reward_token.balance(&keeper) != expected_keeper_balance
+            {
+                return Err(Error::KeeperRewardTransferFailed);
+            }
+
+            events::keeper_ping(env, &keeper, bounty_amount);
+            Ok(bounty_amount)
+        })
     }
 
     /// Read-only: dry-run validation for a proposed withdrawal amount.

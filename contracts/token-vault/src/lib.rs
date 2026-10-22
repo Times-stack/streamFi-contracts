@@ -8,6 +8,7 @@ mod tests;
 mod ttl;
 
 use drip_common::{is_zero_address, TTL_EXTEND_TO};
+use drip_stream::DripStreamClient;
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 use storage::{
@@ -44,6 +45,9 @@ pub const EMERGENCY_MIGRATION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60;
 /// single deposit well below `i128::MAX` leaves headroom for those products
 /// instead of allowing them to overflow downstream.
 pub const MAX_VAULT_DEPOSIT: i128 = 1_000_000_000_000_000_000_000_000_000_000;
+
+/// Maximum number of independent stream contracts processed by one call.
+pub const MAX_STREAM_BATCH_WITHDRAWALS: u32 = 10;
 
 /// Lightweight transient reentrancy guard macro protecting external token transfers.
 ///
@@ -398,6 +402,65 @@ impl TokenVault {
         payouts: Vec<(Address, i128)>,
     ) -> Result<(), Error> {
         withdraw_payouts(&env, &caller, &payouts)
+    }
+
+    /// Withdraw each stream's currently available balance for `recipient`.
+    ///
+    /// The recipient must be the beneficiary of every stream and authorize
+    /// each nested stream withdrawal. Each stream still applies its own
+    /// withdrawal rules; one failure reverts the entire batch.
+    pub fn vault_batch_withdraw(
+        env: Env,
+        stream_ids: Vec<Address>,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        if stream_ids.is_empty() || stream_ids.len() > MAX_STREAM_BATCH_WITHDRAWALS {
+            return Err(Error::InvalidStreamBatch);
+        }
+
+        assert_not_paused(&env)?;
+        non_reentrant!(&env, {
+            let mut payouts = Vec::new(&env);
+            let mut total = 0_i128;
+
+            for index in 0..stream_ids.len() {
+                let stream_address = stream_ids.get(index).ok_or(Error::InvalidStreamBatch)?;
+                for previous_index in 0..index {
+                    if stream_ids.get(previous_index).as_ref() == Some(&stream_address) {
+                        return Err(Error::InvalidStreamBatch);
+                    }
+                }
+
+                let stream = DripStreamClient::new(&env, &stream_address);
+                let stream_recipient = stream
+                    .try_recipient()
+                    .map_err(|_| Error::StreamCallFailed)?;
+                if stream_recipient != recipient {
+                    return Err(Error::NotAuthorized);
+                }
+
+                let amount = stream
+                    .try_withdrawable()
+                    .map_err(|_| Error::StreamCallFailed)?
+                    .map_err(|_| Error::StreamCallFailed)?;
+                if amount < 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                if amount > 0 {
+                    total = total.checked_add(amount).ok_or(Error::ArithmeticOverflow)?;
+                    payouts.push_back((stream_address, amount));
+                }
+            }
+
+            for (stream_address, amount) in payouts.iter() {
+                DripStreamClient::new(&env, &stream_address)
+                    .try_withdraw(&amount)
+                    .map_err(|_| Error::StreamCallFailed)?
+                    .map_err(|_| Error::StreamCallFailed)?;
+            }
+
+            Ok(total)
+        })
     }
 
     /// Owner sets the per-call cap that bounds how much a delegated operator

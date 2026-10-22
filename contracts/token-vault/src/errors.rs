@@ -43,8 +43,8 @@ pub enum Error {
     ReentrancyDetected = 20,
     /// A single deposit exceeded `MAX_VAULT_DEPOSIT`.
     DepositExceedsMax = 21,
-    /// Multi-token deposits require owner approval for the token contract.
-    TokenNotApproved = 22,
-    /// Token balance changed unexpectedly after its first verified use in this ledger.
-    VaultBalanceChanged = 23,
+    /// A stream withdrawal batch is empty, duplicated, or exceeds its cap.
+    InvalidStreamBatch = 22,
+    /// A stream query or withdrawal failed during batch processing.
+    StreamCallFailed = 23,
 }

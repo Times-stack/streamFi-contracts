@@ -5,6 +5,10 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 ## [Unreleased]
 
 ### Added
+- **Keeper reimbursements and `StreamKeeperPing` events (#840).** Streams can configure and fund a separate keeper-reward token pool; each eligible authenticated keeper ping extends instance TTL, pays the configured bounty from that pool, and emits the keeper and actual amount paid. Reward tokens must differ from the stream escrow token.
+- **Batch withdrawals across streams (#841).** Added a bounded `TokenVault::vault_batch_withdraw` coordinator that checks each stream recipient and executes the stream's own authorized withdrawal atomically. Updated ADR-004 and architecture docs to clarify that the vault does not custody stream balances.
+- **Deterministically capped batch execution (#842).** Added `process_batch_with_limit` to process a caller-selected prefix, returning processed and remaining counts. This avoids claiming that contracts can inspect live remaining transaction gas; the existing maximum batch cap remains enforced.
+- **Stream WASM upgrade audit event (#843).** The factory emits `StreamContractUpgraded` with old and new hashes when its deployment template hash actually changes.
 - Extended `scripts/query.sh` with configurable source identities and factory/governor read modes.
 - Added ADR-007 documenting the scope of `BatchTransferProcessor` and updated the architecture overview for supporting contracts and applications.
 - **`batch_transferred` event on `BatchTransferProcessor::process_batch` (#553).** The processor moved real token balances without publishing anything, so indexers had to diff token balances to detect a batch. It now emits `batch_transferred` after the fan-out completes — topics `("batch_transferred", funder)`, data `(token, recipient_count, total)` — with nothing emitted on rejected calls or the empty-batch short-circuit.

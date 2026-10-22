@@ -7,8 +7,7 @@ mod tests;
 
 use drip_common::is_zero_address;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
 };
 
 /// Maximum number of transfers permitted in a single batch (Issue #677).
@@ -36,7 +35,9 @@ pub const MAX_BATCH_LIMIT: u32 = MAX_BATCH_SIZE;
 ///   (wallet + `balance` probes, so a transposed `funder`/`token` pair fails
 ///   with `InvalidToken` before auth) and an instance-TTL keep-alive;
 ///   `preview_batch` was added.
-const VERSION: u32 = 2;
+/// - `3` — added `process_batch_with_limit`, which lets callers bound work
+///   deterministically and reports the processed prefix and remaining items.
+const VERSION: u32 = 3;
 
 /// Instance-storage key space.
 ///
@@ -85,6 +86,8 @@ pub enum Error {
     NotInitialized = 9,
     /// Another batch execution or reentrant call is already in progress.
     ReentrancyForbidden = 10,
+    /// The requested per-call item cap is zero or exceeds `MAX_BATCH_SIZE`.
+    InvalidBatchLimit = 11,
 }
 
 /// Individual execution status for an item in a batch execution (Issue #697).
@@ -94,6 +97,17 @@ pub struct BatchResult {
     pub item_index: u32,
     pub success: bool,
     pub error_code: Option<u32>,
+}
+
+/// Outcome of a deterministically capped batch transfer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialBatchResult {
+    pub results: Vec<BatchResult>,
+    pub requested_count: u32,
+    pub processed_count: u32,
+    pub remaining_count: u32,
+    pub transferred_total: i128,
 }
 
 impl Error {
@@ -380,6 +394,91 @@ impl BatchTransferProcessor {
         Ok(results)
     }
 
+    /// Process at most `max_items` entries from the front of a batch.
+    ///
+    /// This is a deterministic alternative to querying live transaction gas,
+    /// which contract code cannot inspect. `max_items` must be between 1 and
+    /// [`MAX_BATCH_SIZE`]. If the input contains more entries, the unprocessed
+    /// suffix is left untouched and reported in `remaining_count`.
+    pub fn process_batch_with_limit(
+        env: Env,
+        funder: Address,
+        token: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        max_items: u32,
+    ) -> Result<PartialBatchResult, Error> {
+        if recipients.len() != amounts.len() {
+            return Err(Error::LengthMismatch);
+        }
+        if max_items == 0 || max_items > MAX_BATCH_SIZE {
+            return Err(Error::InvalidBatchLimit);
+        }
+
+        let requested_count = recipients.len();
+        let processed_count = requested_count.min(max_items);
+        let remaining_count = requested_count - processed_count;
+        let mut total = 0_i128;
+        for index in 0..processed_count {
+            let amount = amounts.get(index).ok_or(Error::LengthMismatch)?;
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            total = total.checked_add(amount).ok_or(Error::ArithmeticOverflow)?;
+        }
+
+        validate_token(&env, &token)?;
+        let mut results = Vec::new(&env);
+        if processed_count == 0 {
+            return Ok(PartialBatchResult {
+                results,
+                requested_count,
+                processed_count,
+                remaining_count,
+                transferred_total: 0,
+            });
+        }
+
+        ttl::bump(&env);
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(Error::ReentrancyForbidden);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyLock, &true);
+
+        funder.require_auth();
+
+        let tk = token::Client::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+        tk.transfer(&funder, &contract_addr, &total);
+
+        for index in 0..processed_count {
+            let recipient = recipients.get(index).ok_or(Error::LengthMismatch)?;
+            let amount = amounts.get(index).ok_or(Error::LengthMismatch)?;
+            tk.transfer(&contract_addr, &recipient, &amount);
+            results.push_back(BatchResult {
+                item_index: index,
+                success: true,
+                error_code: None,
+            });
+        }
+
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+        env.events().publish(
+            (Symbol::new(&env, "batch_transferred"), funder),
+            (token, processed_count, total),
+        );
+
+        Ok(PartialBatchResult {
+            results,
+            requested_count,
+            processed_count,
+            remaining_count,
+            transferred_total: total,
+        })
+    }
+
     /// Read-only alias for process_batch_detailed (Issue #697).
     pub fn execute_batch(
         env: Env,
@@ -517,7 +616,7 @@ impl BatchTransferProcessor {
     /// instead of feature-probing. Mirrors the role
     /// `DripStream::storage_version` plays for stored layout.
     ///
-    /// See `VERSION` for the current value (`2`) and its history.
+    /// See `VERSION` for the current value and its history.
     pub fn version(_env: Env) -> u32 {
         VERSION
     }

@@ -80,10 +80,10 @@ pub enum DataKey {
     ReferenceTag,
     /// Optional human-readable description set at creation (#845).
     StreamDescription,
-    /// Optional metadata URI for stream invoices (Issue #748).
-    InvoiceMetadataUri,
-    /// Optional metadata URI for stream milestones (Issue #748).
-    MilestoneMetadataUri,
+    /// Separately funded token pool used to reimburse stream keepers (#840).
+    KeeperRewardPool,
+    /// Last ledger on which a keeper reward was paid.
+    LastKeeperPingLedger,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).
@@ -96,6 +96,14 @@ pub struct ImmutableConfig {
     pub rate_per_second: i128,
     pub sender: Address,
     pub recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamKeeperRewardPool {
+    pub token: Address,
+    pub reward_per_ping: i128,
+    pub balance: i128,
 }
 
 #[contracttype]

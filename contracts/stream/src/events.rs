@@ -1,4 +1,4 @@
-use soroban_sdk::{panic_with_error, symbol_short, Address, Env};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Symbol};
 
 use crate::Error;
 
@@ -262,6 +262,65 @@ pub fn min_withdrawal_interval_set(env: &Env, sender: &Address, interval_seconds
     env.events().publish(
         (symbol_short!("min_w_int"), sender.clone(), sequence),
         interval_seconds,
+    );
+}
+
+pub fn keeper_ping(env: &Env, keeper: &Address, bounty_amount: i128) {
+    assert_non_negative_amount(env, bounty_amount);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamKeeperPing"),
+            keeper.clone(),
+            sequence,
+        ),
+        bounty_amount,
+    );
+}
+
+pub fn keeper_reward_pool_configured(
+    env: &Env,
+    caller: &Address,
+    reward_token: &Address,
+    reward_per_ping: i128,
+) {
+    assert_non_negative_amount(env, reward_per_ping);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("keeper_cfg"), caller.clone(), sequence),
+        (reward_token.clone(), reward_per_ping),
+    );
+}
+
+pub fn keeper_reward_pool_funded(
+    env: &Env,
+    funder: &Address,
+    reward_token: &Address,
+    amount: i128,
+) {
+    assert_non_negative_amount(env, amount);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("keeper_fnd"), funder.clone(), sequence),
+        (reward_token.clone(), amount),
+    );
+}
+
+pub fn keeper_reward_pool_withdrawn(
+    env: &Env,
+    caller: &Address,
+    reward_token: &Address,
+    amount: i128,
+) {
+    assert_non_negative_amount(env, amount);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("keeper_wd"), caller.clone(), sequence),
+        (reward_token.clone(), amount),
     );
 }
 
