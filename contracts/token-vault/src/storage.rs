@@ -243,18 +243,29 @@ pub fn remove_emergency_migration(env: &Env) {
 
 /// Explicit owner approval is required before accepting a multi-token deposit.
 pub fn is_token_approved(env: &Env, token: &Address) -> bool {
-    env.storage().instance().get(&DataKey::ApprovedToken(token.clone())).unwrap_or(false)
+    env.storage()
+        .instance()
+        .get(&DataKey::ApprovedToken(token.clone()))
+        .unwrap_or(false)
 }
 
 pub fn set_token_approved(env: &Env, token: &Address, allowed: bool) {
-    env.storage().instance().set(&DataKey::ApprovedToken(token.clone()), &allowed);
+    env.storage()
+        .instance()
+        .set(&DataKey::ApprovedToken(token.clone()), &allowed);
 }
 
 /// Store the last verified balance during this ledger. A subsequent call
 /// observing a different balance cannot use a potentially manipulated value.
 pub fn check_vault_balance(env: &Env, token: &Address, balance: i128) -> bool {
-    match env.storage().instance().get::<_, VaultBalanceSnapshot>(&DataKey::BalanceSnapshot(token.clone())) {
-        Some(snapshot) if snapshot.ledger == env.ledger().sequence() => snapshot.expected_balance == balance,
+    match env
+        .storage()
+        .instance()
+        .get::<_, VaultBalanceSnapshot>(&DataKey::BalanceSnapshot(token.clone()))
+    {
+        Some(snapshot) if snapshot.ledger == env.ledger().sequence() => {
+            snapshot.expected_balance == balance
+        }
         _ => true,
     }
 }
@@ -264,19 +275,28 @@ pub fn record_vault_balance(env: &Env, token: &Address, balance: i128) {
         ledger: env.ledger().sequence(),
         expected_balance: balance,
     };
-    env.storage().instance().set(&DataKey::BalanceSnapshot(token.clone()), &snapshot);
+    env.storage()
+        .instance()
+        .set(&DataKey::BalanceSnapshot(token.clone()), &snapshot);
 }
 
 fn track_vault_key(env: &Env, key: &DataKey) {
-    let mut keys: Vec<DataKey> = env.storage().instance()
+    let mut keys: Vec<DataKey> = env
+        .storage()
+        .instance()
         .get(&DataKey::TrackedVaultKeys)
         .unwrap_or(Vec::new(env));
     if !keys.contains(key) {
         keys.push_back(key.clone());
-        env.storage().instance().set(&DataKey::TrackedVaultKeys, &keys);
+        env.storage()
+            .instance()
+            .set(&DataKey::TrackedVaultKeys, &keys);
     }
 }
 
 pub fn tracked_vault_keys(env: &Env) -> Vec<DataKey> {
-    env.storage().instance().get(&DataKey::TrackedVaultKeys).unwrap_or(Vec::new(env))
+    env.storage()
+        .instance()
+        .get(&DataKey::TrackedVaultKeys)
+        .unwrap_or(Vec::new(env))
 }
