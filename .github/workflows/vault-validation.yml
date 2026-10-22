@@ -1,0 +1,36 @@
+name: Token Vault Security Validation
+
+on:
+  push:
+    branches:
+      - feat/issues-811-812-813-814-vault-safety
+  pull_request:
+    branches: [main]
+    paths:
+      - 'contracts/token-vault/**'
+      - '.github/workflows/vault-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  vault-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p token-vault
+      - name: Vault regression tests
+        run: cargo test -p token-vault --lib
+      - name: Clippy
+        run: cargo clippy -p token-vault --all-targets -- -D warnings
+      - name: WASM build
+        run: cargo build -p token-vault --target wasm32-unknown-unknown --release
+      - name: Vault formatting
+        run: cargo fmt -p token-vault -- --check

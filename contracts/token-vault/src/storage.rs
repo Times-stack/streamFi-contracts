@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 
 #[contracttype]
 #[derive(Clone)]
@@ -42,6 +42,19 @@ pub enum DataKey {
     EmergencyMigration,
     /// Transient reentrancy guard lock flag for external token transfers.
     ReentrancyLock,
+    /// Owner-approved SEP-0041 token contract address.
+    ApprovedToken(Address),
+    /// First observed / last verified vault balance in a ledger.
+    BalanceSnapshot(Address),
+    /// Index of persistent token-account and token-limit keys requiring renewal.
+    TrackedVaultKeys,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultBalanceSnapshot {
+    pub ledger: u32,
+    pub expected_balance: i128,
 }
 
 #[contracttype]
@@ -195,6 +208,7 @@ pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, 
     let key = DataKey::TokenAccountBalance(token.clone(), account.clone());
     env.storage().persistent().set(&key, &balance);
     drip_common::ttl::bump_persistent(env, &key);
+    track_vault_key(env, &key);
 }
 
 pub fn get_token_max_limit(env: &Env, token: &Address) -> Option<i128> {
@@ -207,6 +221,7 @@ pub fn set_token_max_limit(env: &Env, token: &Address, limit: &i128) {
     let key = DataKey::TokenMaxLimit(token.clone());
     env.storage().persistent().set(&key, limit);
     drip_common::ttl::bump_persistent(env, &key);
+    track_vault_key(env, &key);
 }
 
 pub fn set_emergency_migration(env: &Env, m: &EmergencyMigration) {
@@ -223,4 +238,64 @@ pub fn remove_emergency_migration(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::EmergencyMigration);
+}
+
+/// Explicit owner approval is required before accepting a multi-token deposit.
+pub fn is_token_approved(env: &Env, token: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::ApprovedToken(token.clone()))
+        .unwrap_or(false)
+}
+
+pub fn set_token_approved(env: &Env, token: &Address, allowed: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ApprovedToken(token.clone()), &allowed);
+}
+
+/// Store the last verified balance during this ledger. A subsequent call
+/// observing a different balance cannot use a potentially manipulated value.
+pub fn check_vault_balance(env: &Env, token: &Address, balance: i128) -> bool {
+    match env
+        .storage()
+        .instance()
+        .get::<_, VaultBalanceSnapshot>(&DataKey::BalanceSnapshot(token.clone()))
+    {
+        Some(snapshot) if snapshot.ledger == env.ledger().sequence() => {
+            snapshot.expected_balance == balance
+        }
+        _ => true,
+    }
+}
+
+pub fn record_vault_balance(env: &Env, token: &Address, balance: i128) {
+    let snapshot = VaultBalanceSnapshot {
+        ledger: env.ledger().sequence(),
+        expected_balance: balance,
+    };
+    env.storage()
+        .instance()
+        .set(&DataKey::BalanceSnapshot(token.clone()), &snapshot);
+}
+
+fn track_vault_key(env: &Env, key: &DataKey) {
+    let mut keys: Vec<DataKey> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TrackedVaultKeys)
+        .unwrap_or(Vec::new(env));
+    if !keys.contains(key) {
+        keys.push_back(key.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::TrackedVaultKeys, &keys);
+    }
+}
+
+pub fn tracked_vault_keys(env: &Env) -> Vec<DataKey> {
+    env.storage()
+        .instance()
+        .get(&DataKey::TrackedVaultKeys)
+        .unwrap_or(Vec::new(env))
 }
