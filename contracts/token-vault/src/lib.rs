@@ -171,9 +171,6 @@ fn withdraw_payouts(
         }
 
         let balance = vault_balance(env)?;
-        if !check_vault_balance(env, &token, balance) {
-            return Err(Error::VaultBalanceChanged);
-        }
         if total > balance {
             return Err(Error::LimitExceeded);
         }
@@ -260,9 +257,6 @@ impl TokenVault {
             let balance = vault_balance(&env)?;
             let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
             if !is_token_approved(&env, &default_token) { return Err(Error::TokenNotApproved); }
-            if !check_vault_balance(&env, &default_token, balance) {
-                return Err(Error::VaultBalanceChanged);
-            }
             let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
 
             let expected_balance = balance
@@ -270,6 +264,9 @@ impl TokenVault {
                 .ok_or(Error::ArithmeticOverflow)?;
             if expected_balance > max {
                 return Err(Error::LimitExceeded);
+            }
+            if !check_vault_balance(&env, &default_token, balance) {
+                return Err(Error::VaultBalanceChanged);
             }
 
             let tk = token_client(&env)?;
@@ -349,14 +346,14 @@ impl TokenVault {
             let balance = vault_balance(&env)?;
             let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
             if !is_token_approved(&env, &default_token) { return Err(Error::TokenNotApproved); }
-            if !check_vault_balance(&env, &default_token, balance) {
-                return Err(Error::VaultBalanceChanged);
-            }
             let expected_balance = balance
                 .checked_add(total_deposit)
                 .ok_or(Error::ArithmeticOverflow)?;
             if expected_balance > max {
                 return Err(Error::LimitExceeded);
+            }
+            if !check_vault_balance(&env, &default_token, balance) {
+                return Err(Error::VaultBalanceChanged);
             }
 
             let tk = token_client(&env)?;
@@ -822,9 +819,6 @@ impl TokenVault {
 
             let tk = token::Client::new(&env, &token);
             let vault_bal = tk.balance(&env.current_contract_address());
-            if !check_vault_balance(&env, &token, vault_bal) {
-                return Err(Error::VaultBalanceChanged);
-            }
             if amount > vault_bal {
                 return Err(Error::LimitExceeded);
             }
