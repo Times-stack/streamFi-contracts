@@ -19,7 +19,8 @@ use storage::{
     set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
     set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
     set_pending_owner_proposed_at, set_pending_owner_proposer, set_token,
-    set_token_account_balance, set_token_max_limit, DataKey, EmergencyMigration,
+    set_token_account_balance, set_token_max_limit, is_token_approved, set_token_approved,
+    check_vault_balance, record_vault_balance, DataKey, EmergencyMigration,
 };
 use ttl::bump_instance;
 
@@ -170,6 +171,9 @@ fn withdraw_payouts(
         }
 
         let balance = vault_balance(env)?;
+        if !check_vault_balance(env, &token, balance) {
+            return Err(Error::VaultBalanceChanged);
+        }
         if total > balance {
             return Err(Error::LimitExceeded);
         }
@@ -187,6 +191,7 @@ fn withdraw_payouts(
             if new_balance != expected_balance {
                 return Err(Error::WithdrawTransferFailed);
             }
+            record_vault_balance(env, &token, new_balance);
             events::withdrawn(env, caller, &to, amount, new_balance, by_operator);
         }
 
@@ -230,6 +235,7 @@ impl TokenVault {
         bump_instance(&env);
         set_owner(&env, &owner);
         set_token(&env, &token);
+        set_token_approved(&env, &token, true);
         set_max_limit(&env, &max_limit);
         store_owner_proposal_ttl(&env, OWNER_PROPOSAL_TTL_SECONDS);
 
@@ -252,6 +258,10 @@ impl TokenVault {
 
             let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             let balance = vault_balance(&env)?;
+            let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            if !check_vault_balance(&env, &default_token, balance) {
+                return Err(Error::VaultBalanceChanged);
+            }
             let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
 
             let expected_balance = balance
@@ -277,6 +287,7 @@ impl TokenVault {
                 set_token_account_balance(&env, &default_token, &from, new_acc_bal);
             }
 
+            record_vault_balance(&env, &default_token, new_balance);
             bump_instance(&env);
             events::deposited(&env, &from, amount, new_balance);
             Ok(())
@@ -335,6 +346,10 @@ impl TokenVault {
             }
 
             let balance = vault_balance(&env)?;
+            let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            if !check_vault_balance(&env, &default_token, balance) {
+                return Err(Error::VaultBalanceChanged);
+            }
             let expected_balance = balance
                 .checked_add(total_deposit)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -358,6 +373,7 @@ impl TokenVault {
             if final_balance != expected_balance {
                 return Err(Error::DepositTransferFailed);
             }
+            record_vault_balance(&env, &default_token, final_balance);
 
             bump_instance(&env);
             Ok(())
@@ -736,6 +752,13 @@ impl TokenVault {
                 return Err(Error::DepositExceedsMax);
             }
 
+            if !is_token_approved(&env, &token) {
+                return Err(Error::TokenNotApproved);
+            }
+            let before = token::Client::new(&env, &token).balance(&env.current_contract_address());
+            if !check_vault_balance(&env, &token, before) {
+                return Err(Error::VaultBalanceChanged);
+            }
             if let Some(max) = get_token_max_limit(&env, &token) {
                 let tk_client = token::Client::new(&env, &token);
                 let current_vault_balance = tk_client.balance(&env.current_contract_address());
@@ -749,6 +772,11 @@ impl TokenVault {
 
             let tk = token::Client::new(&env, &token);
             tk.transfer(&from, &env.current_contract_address(), &amount);
+            let after = tk.balance(&env.current_contract_address());
+            if after != before.checked_add(amount).ok_or(Error::ArithmeticOverflow)? {
+                return Err(Error::DepositTransferFailed);
+            }
+            record_vault_balance(&env, &token, after);
 
             let current_acc_balance = get_token_account_balance(&env, &token, &from);
             let new_acc_balance = current_acc_balance
@@ -791,6 +819,9 @@ impl TokenVault {
 
             let tk = token::Client::new(&env, &token);
             let vault_bal = tk.balance(&env.current_contract_address());
+            if !check_vault_balance(&env, &token, vault_bal) {
+                return Err(Error::VaultBalanceChanged);
+            }
             if amount > vault_bal {
                 return Err(Error::LimitExceeded);
             }
@@ -807,6 +838,10 @@ impl TokenVault {
             }
 
             let new_vault_bal = tk.balance(&env.current_contract_address());
+            if new_vault_bal != vault_bal.checked_sub(amount).ok_or(Error::ArithmeticOverflow)? {
+                return Err(Error::WithdrawTransferFailed);
+            }
+            record_vault_balance(&env, &token, new_vault_bal);
             let by_operator = caller != owner;
             events::withdrawn(&env, &caller, &to, amount, new_vault_bal, by_operator);
 
@@ -853,6 +888,75 @@ impl TokenVault {
     /// Read-only: pre-flight check validating that target token adheres to standard SEP-0041 interface (Issue #696).
     pub fn is_token_compliant(env: Env, token: Address) -> bool {
         validate_sep41_token(&env, &token).is_ok()
+    }
+
+
+    /// Owner-maintained audited token contract allowlist (issue #812).
+    /// Revocation blocks new deposits but never blocks withdrawals of existing funds.
+    pub fn approve_token(env: Env, caller: Address, token: Address, approved: bool) -> Result<(), Error> {
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner { return Err(Error::NotAuthorized); }
+        caller.require_auth();
+        if approved { validate_sep41_token(&env, &token)?; }
+        set_token_approved(&env, &token, approved);
+        bump_instance(&env);
+        events::token_approval_changed(&env, &token, approved);
+        Ok(())
+    }
+
+    /// Check whether the owner has approved this exact token contract address.
+    pub fn is_token_approved(env: Env, token: Address) -> bool {
+        is_token_approved(&env, &token)
+    }
+
+    /// Renew every tracked, still-present persistent token balance and limit key.
+    ///
+    /// This is permissionless so keepers can preserve balances during long pauses.
+    /// Call regularly before persistent entries expire. See issue #814.
+    pub fn bump_all_vault_keys(env: Env) -> Result<u32, Error> {
+        let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        bump_instance(&env);
+        let count = ttl::bump_all_vault_keys(&env);
+        events::vault_keys_refreshed(&env, count);
+        Ok(count)
+    }
+
+    /// Non-reverting variant of a deposit for durable failure monitoring (#813).
+    ///
+    /// A reverted Soroban invocation rolls back all its events. Thus unlike
+    /// `deposit`, a rejected token transfer returns `Ok(false)` and commits a
+    /// VaultDepositFailed event. `Ok(true)` means the deposit actually settled.
+    /// Preflight authorization, limits and invariant errors still return Err.
+    pub fn deposit_with_failure_report(env: Env, from: Address, amount: i128) -> Result<bool, Error> {
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            require_owner_or_operator(&env, &from, &owner)?;
+            if amount <= 0 { return Err(Error::InvalidAmount); }
+            if amount > MAX_VAULT_DEPOSIT { return Err(Error::DepositExceedsMax); }
+            let token = get_token(&env).ok_or(Error::NotInitialized)?;
+            let tk = token::Client::new(&env, &token);
+            let before = tk.balance(&env.current_contract_address());
+            if !check_vault_balance(&env, &token, before) {
+                return Err(Error::VaultBalanceChanged);
+            }
+            let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
+            let expected = before.checked_add(amount).ok_or(Error::ArithmeticOverflow)?;
+            if expected > max { return Err(Error::LimitExceeded); }
+            if tk.try_transfer(&from, &env.current_contract_address(), &amount).is_err() {
+                events::vault_deposit_failed(&env, &from, &token, amount);
+                return Ok(false);
+            }
+            let after = tk.balance(&env.current_contract_address());
+            if after != expected { return Err(Error::DepositTransferFailed); }
+            let previous = get_token_account_balance(&env, &token, &from);
+            let credited = previous.checked_add(amount).ok_or(Error::ArithmeticOverflow)?;
+            set_token_account_balance(&env, &token, &from, credited);
+            record_vault_balance(&env, &token, after);
+            bump_instance(&env);
+            events::deposited(&env, &from, amount, after);
+            Ok(true)
+        })
     }
 
     // ── Emergency Migration to cold storage (Issue #679) ──────────────────
