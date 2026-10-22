@@ -11,16 +11,17 @@ use drip_common::{is_zero_address, TTL_EXTEND_TO};
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 use storage::{
-    get_emergency_migration, get_max_limit, get_operator, get_operator_withdraw_limit, get_owner,
+    check_vault_balance, get_emergency_migration, get_max_limit, get_operator, get_operator_withdraw_limit, get_owner,
     get_owner_proposal_ttl, get_pending_owner, get_pending_owner_proposed_at,
     get_pending_owner_proposer, get_token, get_token_account_balance, get_token_max_limit,
-    is_paused, remove_emergency_migration, remove_operator, remove_pending_owner,
+    is_paused, is_token_approved, record_vault_balance, remove_emergency_migration,
+    remove_operator, remove_pending_owner,
     remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_emergency_migration,
     set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
     set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
     set_pending_owner_proposed_at, set_pending_owner_proposer, set_token,
-    check_vault_balance, is_token_approved, record_vault_balance, set_token_account_balance,
-    set_token_approved, set_token_max_limit, DataKey, EmergencyMigration,
+    set_token_account_balance, set_token_approved, set_token_max_limit, DataKey,
+    EmergencyMigration,
 };
 use ttl::bump_instance;
 
@@ -777,7 +778,11 @@ impl TokenVault {
             let tk = token::Client::new(&env, &token);
             tk.transfer(&from, &env.current_contract_address(), &amount);
             let after = tk.balance(&env.current_contract_address());
-            if after != before.checked_add(amount).ok_or(Error::ArithmeticOverflow)? {
+            if after
+                != before
+                    .checked_add(amount)
+                    .ok_or(Error::ArithmeticOverflow)?
+            {
                 return Err(Error::DepositTransferFailed);
             }
             record_vault_balance(&env, &token, after);
@@ -839,7 +844,11 @@ impl TokenVault {
             }
 
             let new_vault_bal = tk.balance(&env.current_contract_address());
-            if new_vault_bal != vault_bal.checked_sub(amount).ok_or(Error::ArithmeticOverflow)? {
+            if new_vault_bal
+                != vault_bal
+                    .checked_sub(amount)
+                    .ok_or(Error::ArithmeticOverflow)?
+            {
                 return Err(Error::WithdrawTransferFailed);
             }
             record_vault_balance(&env, &token, new_vault_bal);
@@ -890,7 +899,6 @@ impl TokenVault {
     pub fn is_token_compliant(env: Env, token: Address) -> bool {
         validate_sep41_token(&env, &token).is_ok()
     }
-
 
     /// Owner-maintained audited token contract allowlist (issue #812).
     /// Revocation blocks new deposits but never blocks withdrawals of existing funds.

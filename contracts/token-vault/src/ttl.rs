@@ -6,7 +6,6 @@
 
 pub use drip_common::ttl::bump_instance;
 
-
 /// Renew all still-live persistent token-vault keys recorded in the index.
 pub fn bump_all_vault_keys(env: &soroban_sdk::Env) -> u32 {
     let keys = crate::storage::tracked_vault_keys(env);

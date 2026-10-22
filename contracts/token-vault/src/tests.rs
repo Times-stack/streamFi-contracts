@@ -1527,7 +1527,6 @@ fn test_reentrancy_guard_blocks_nested_transfers() {
     assert!(s.client.try_withdraw(&s.owner, &s.user, &1_000).is_ok());
 }
 
-
 // ── Ledger balance snapshots / asset approval / failure receipts / TTL ──
 
 #[test]
@@ -1563,7 +1562,8 @@ fn approved_tokens_only_and_revocation_preserves_withdrawal() {
         s.client.try_deposit_token(&s.owner, &other_token, &10),
         Err(Ok(Error::TokenNotApproved))
     );
-    s.client.withdraw_token(&s.owner, &other_token, &s.user, &25);
+    s.client
+        .withdraw_token(&s.owner, &other_token, &s.user, &25);
     assert_eq!(other.balance(&s.client.address), 75);
 }
 
@@ -1586,7 +1586,8 @@ fn failed_token_transfer_can_be_reported_without_reverting_event() {
 fn batch_key_renewal_covers_account_balances_and_token_limits() {
     let s = Setup::new(1_000_000);
     s.client.deposit(&s.owner, &100);
-    s.client.set_token_max_limit(&s.owner, &s.token.address, &500_000);
+    s.client
+        .set_token_max_limit(&s.owner, &s.token.address, &500_000);
     assert_eq!(s.client.bump_all_vault_keys(), 2);
     // Existing permissionless keep_alive must also extend indexed entries.
     s.client.keep_alive();
@@ -1602,7 +1603,10 @@ fn default_asset_revocation_stops_deposits_not_withdrawals() {
     let s = Setup::new(1_000_000);
     s.client.deposit(&s.owner, &100);
     s.client.approve_token(&s.owner, &s.token.address, &false);
-    assert_eq!(s.client.try_deposit(&s.owner, &10), Err(Ok(Error::TokenNotApproved)));
+    assert_eq!(
+        s.client.try_deposit(&s.owner, &10),
+        Err(Ok(Error::TokenNotApproved))
+    );
     s.client.withdraw(&s.owner, &s.user, &25);
     assert_eq!(s.token.balance(&s.client.address), 75);
 }

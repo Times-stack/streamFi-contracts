@@ -234,7 +234,6 @@ pub fn kept_alive(env: &Env, new_ttl: u32) {
         .publish((Symbol::new(env, "kept_alive"),), new_ttl);
 }
 
-
 /// Committed only by the non-reverting deposit reporting endpoint.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,12 +247,17 @@ pub struct VaultDepositFailure {
 pub fn vault_deposit_failed(env: &Env, from: &Address, token: &Address, amount: i128) {
     env.events().publish(
         (Symbol::new(env, "VaultDepositFailed"), from.clone()),
-        VaultDepositFailure { token: token.clone(), amount, reason_code: 1 },
+        VaultDepositFailure {
+            token: token.clone(),
+            amount,
+            reason_code: 1,
+        },
     );
 }
 
 pub fn token_approval_changed(env: &Env, token: &Address, approved: bool) {
-    env.events().publish((symbol_short!("tok_allow"), token.clone()), approved);
+    env.events()
+        .publish((symbol_short!("tok_allow"), token.clone()), approved);
 }
 
 pub fn vault_keys_refreshed(env: &Env, count: u32) {

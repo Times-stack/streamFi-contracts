@@ -240,7 +240,6 @@ pub fn remove_emergency_migration(env: &Env) {
         .remove(&DataKey::EmergencyMigration);
 }
 
-
 /// Explicit owner approval is required before accepting a multi-token deposit.
 pub fn is_token_approved(env: &Env, token: &Address) -> bool {
     env.storage()
