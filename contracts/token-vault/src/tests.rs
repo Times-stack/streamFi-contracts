@@ -1526,3 +1526,83 @@ fn test_reentrancy_guard_blocks_nested_transfers() {
     });
     assert!(s.client.try_withdraw(&s.owner, &s.user, &1_000).is_ok());
 }
+
+
+// ── Ledger balance snapshots / asset approval / failure receipts / TTL ──
+
+#[test]
+fn vault_rejects_unexpected_same_ledger_balance_changes() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &100);
+    // An unsolicited transfer changes live token balances without updating
+    // the vault's last verified expected balance.
+    s.token.transfer(&s.user, &s.client.address, &10);
+    assert_eq!(
+        s.client.try_deposit(&s.owner, &20),
+        Err(Ok(Error::VaultBalanceChanged))
+    );
+}
+
+#[test]
+fn approved_tokens_only_and_revocation_preserves_withdrawal() {
+    let s = Setup::new(1_000_000);
+    assert!(s.client.is_token_approved(&s.token.address));
+    let admin = Address::generate(&s.env);
+    let other_token = s.env.register_stellar_asset_contract_v2(admin).address();
+    let other = token::Client::new(&s.env, &other_token);
+    token::StellarAssetClient::new(&s.env, &other_token).mint(&s.owner, &1000);
+    assert_eq!(
+        s.client.try_deposit_token(&s.owner, &other_token, &10),
+        Err(Ok(Error::TokenNotApproved))
+    );
+    s.client.approve_token(&s.owner, &other_token, &true);
+    s.client.deposit_token(&s.owner, &other_token, &100);
+    assert_eq!(other.balance(&s.client.address), 100);
+    s.client.approve_token(&s.owner, &other_token, &false);
+    assert_eq!(
+        s.client.try_deposit_token(&s.owner, &other_token, &10),
+        Err(Ok(Error::TokenNotApproved))
+    );
+    s.client.withdraw_token(&s.owner, &other_token, &s.user, &25);
+    assert_eq!(other.balance(&s.client.address), 75);
+}
+
+#[test]
+fn failed_token_transfer_can_be_reported_without_reverting_event() {
+    let s = Setup::new(1_000_000);
+    // Move away the owner's entire balance before attempting a deposit.
+    s.token.transfer(&s.owner, &s.user, &1_000_000);
+    assert!(!s.client.deposit_with_failure_report(&s.owner, &100));
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    let events = vault_events(&s);
+    let (_, topics, _) = events.last().unwrap();
+    assert_eq!(
+        topics.clone(),
+        (Symbol::new(&s.env, "VaultDepositFailed"), s.owner.clone()).into_val(&s.env)
+    );
+}
+
+#[test]
+fn batch_key_renewal_covers_account_balances_and_token_limits() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &100);
+    s.client.set_token_max_limit(&s.owner, &s.token.address, &500_000);
+    assert_eq!(s.client.bump_all_vault_keys(), 2);
+    // Existing permissionless keep_alive must also extend indexed entries.
+    s.client.keep_alive();
+    let contract = s.client.address.clone();
+    s.env.as_contract(&contract, || {
+        let key = storage::DataKey::TokenAccountBalance(s.token.address.clone(), s.owner.clone());
+        assert!(s.env.storage().persistent().has(&key));
+    });
+}
+
+#[test]
+fn default_asset_revocation_stops_deposits_not_withdrawals() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &100);
+    s.client.approve_token(&s.owner, &s.token.address, &false);
+    assert_eq!(s.client.try_deposit(&s.owner, &10), Err(Ok(Error::TokenNotApproved)));
+    s.client.withdraw(&s.owner, &s.user, &25);
+    assert_eq!(s.token.balance(&s.client.address), 75);
+}
