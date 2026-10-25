@@ -41,4 +41,8 @@ pub enum Error {
     AlreadyVoted = 18,
     /// Voter had zero checkpointed voting weight at the proposal's snapshot ledger.
     InsufficientVotingWeight = 19,
+    /// An admin authority transfer is already pending.
+    AdminTransferAlreadyInProgress = 20,
+    /// Proposal stake configuration is missing or invalid.
+    ProposalStakeNotConfigured = 21,
 }

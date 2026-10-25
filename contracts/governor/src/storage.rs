@@ -66,6 +66,7 @@ pub struct Proposal {
 /// - `FeeManager`  — `set_fee_bps`, `set_fee_recipient`.
 /// - `RateManager` — `set_max_rate`, `set_min_duration`.
 /// - `Pauser`      — `governor_pause`, `governor_unpause`, `pause_factory`, `unpause_factory`.
+/// - `Executor`    — execute proposals after their timelock and quorum checks.
 ///
 /// A role may be held by any number of accounts, and one account may hold any
 /// combination of roles.
@@ -80,6 +81,7 @@ pub enum Role {
     FeeManager,
     RateManager,
     Pauser,
+    Executor,
 }
 
 /// Composite key identifying a single (role, account) grant.
@@ -136,6 +138,14 @@ pub enum DataKey {
     ProposalCounter,
     /// Minimum quorum threshold in basis points (e.g. 2000 = 20%).
     MinQuorumBps,
+    /// Governance token address used to escrow proposal stake.
+    ProposalStakeToken,
+    /// Minimum token amount required to create a proposal.
+    MinProposalStake,
+    /// Proposal stake amount held until quorum is reached.
+    ProposalStake(u64),
+    /// Token used to escrow the stake for a proposal.
+    ProposalStakeTokenByProposal(u64),
     /// Optional total governance supply override; defaults to AdminCount if not set.
     GovernanceSupply,
     /// Historical token balance / voting weight checkpoints per account.
