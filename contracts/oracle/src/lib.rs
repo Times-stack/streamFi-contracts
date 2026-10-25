@@ -2606,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn get_twap_price_rejects_stale_price() {
+    fn get_twap_price_handles_missing_heartbeat_after_network_partition() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
         grant_admin_feeder(&client, &admin);
@@ -2623,6 +2623,22 @@ mod tests {
 
         client.submit_price(&admin, &50_000_000);
 
+        // A heartbeat exactly at the staleness boundary remains usable.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 60,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        assert_eq!(client.get_twap_price(), 50_000_000);
+
+        // Simulate a partition that delays the next heartbeat beyond the
+        // configured 60-second window. The read returns a stale-feed error
+        // rather than panicking or reusing the old price.
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 61,
             protocol_version: 21,
@@ -2633,7 +2649,6 @@ mod tests {
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6_312_000,
         });
-
         let result = client.try_get_twap_price();
         assert_eq!(result, Err(Ok(Error::OracleStalePrice)));
     }
