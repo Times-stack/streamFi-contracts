@@ -115,6 +115,11 @@ pub fn require_role(env: &Env, caller: &Address, role: Role) -> Result<(), Error
         .map_err(|_| Error::NotAuthorized)
 }
 
+/// Requires that `caller` is authorized and holds the `Executor` role.
+pub fn require_executor(env: &Env, caller: &Address) -> Result<(), Error> {
+    require_role(env, caller, Role::Executor)
+}
+
 /// Returns a page of accounts currently holding `role`.
 ///
 /// Reads from the `RoleMembers` index maintained by `grant`/`revoke`.
@@ -162,6 +167,9 @@ pub fn require_emergency_responder(env: &Env, caller: &Address) -> Result<(), Er
 /// Propose transferring the admin role to a new address (step 1 of 2) (Issue #682).
 pub fn propose_admin(env: &Env, proposer: &Address, new_admin: &Address) -> Result<(), Error> {
     require_role(env, proposer, Role::Admin)?;
+    if env.storage().instance().has(&DataKey::PendingAuthority) {
+        return Err(Error::AdminTransferAlreadyInProgress);
+    }
     if has_role(env, Role::Admin, new_admin) {
         return Err(Error::InvalidParam);
     }
