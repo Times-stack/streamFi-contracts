@@ -34,7 +34,7 @@ pub use config::GovernorConfig;
 pub use errors::Error;
 pub use role::{Role, RoleMembersPage};
 use storage::DataKey;
-pub use storage::{BalanceCheckpoint, Proposal, ProposalStatus, VoteTallySnapshot};
+pub use storage::{BalanceCheckpoint, Proposal, ProposalStatus, VoteRecord, VoteTallySnapshot};
 
 /// Returns `true` when the governor is under an emergency pause.
 ///
@@ -61,6 +61,91 @@ fn set_paused(env: &Env, paused: bool) {
 /// gate `DripFactory`, `TwapOracle`, and `TokenVault` run.
 fn assert_not_paused(env: &Env) -> Result<(), Error> {
     drip_common::pause::require_not_paused(env, &DataKey::Paused).map_err(|_| Error::ContractPaused)
+}
+
+fn cast_ballot(
+    env: Env,
+    voter: Address,
+    proposal_id: u64,
+    support: Option<bool>,
+    rationale: Option<String>,
+) -> Result<(), Error> {
+    voter.require_auth();
+    ttl::bump(&env);
+
+    if storage::has_voted(&env, proposal_id, &voter) {
+        return Err(Error::AlreadyVoted);
+    }
+
+    let mut proposal: storage::Proposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::Proposal(proposal_id))
+        .ok_or(Error::ProposalNotFound)?;
+    if proposal.status != storage::ProposalStatus::Pending
+        && proposal.status != storage::ProposalStatus::Active
+    {
+        return Err(Error::ProposalNotPending);
+    }
+
+    let elapsed = env.ledger().timestamp().saturating_sub(proposal.created_at);
+    if elapsed
+        > proposal
+            .execution_window_secs
+            .saturating_add(DripGovernor::MIN_EXECUTION_DELAY)
+    {
+        return Err(Error::ProposalExpired);
+    }
+
+    let weight = match storage::get_checkpoint_weight(&env, &voter, proposal.snapshot_ledger) {
+        Some(0) => return Err(Error::InsufficientVotingWeight),
+        Some(weight) => weight,
+        None => 1,
+    };
+    match support {
+        Some(true) => proposal.for_votes = proposal.for_votes.saturating_add(weight),
+        Some(false) => proposal.against_votes = proposal.against_votes.saturating_add(weight),
+        None => {
+            storage::add_abstain_votes(&env, proposal_id, weight);
+        }
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::Proposal(proposal_id), &proposal);
+    storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Active);
+
+    let previous_snapshot = storage::get_vote_tally_snapshot(&env, proposal_id);
+    let total_supply = previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.total_supply)
+        .unwrap_or_else(|| {
+            env.storage()
+                .instance()
+                .get(&DataKey::GovernanceSupply)
+                .unwrap_or_else(|| {
+                    env.storage()
+                        .instance()
+                        .get::<_, u32>(&DataKey::AdminCount)
+                        .unwrap_or(1) as u64
+                })
+        });
+    let snapshot = storage::VoteTallySnapshot {
+        proposal_id,
+        snapshot_ledger: proposal.snapshot_ledger,
+        for_votes: proposal.for_votes,
+        against_votes: proposal.against_votes,
+        total_supply,
+    };
+    storage::save_vote_tally_snapshot(&env, &snapshot);
+    storage::record_voter_receipt(&env, proposal_id, &voter, weight);
+
+    if let Some(support) = support {
+        events::vote_cast(&env, &voter, proposal_id, support, rationale);
+    } else {
+        events::vote_abstain_cast(&env, &voter, proposal_id);
+    }
+    Ok(())
 }
 
 #[contract]
@@ -767,6 +852,11 @@ impl DripGovernor {
         storage::get_vote_tally_snapshot(&env, proposal_id).ok_or(Error::ProposalNotFound)
     }
 
+    /// Read-only: returns the immutable vote distribution archived after a proposal ends.
+    pub fn get_vote_record(env: Env, proposal_id: u64) -> Result<VoteRecord, Error> {
+        storage::get_vote_record(&env, proposal_id).ok_or(Error::ProposalNotFound)
+    }
+
     /// Create a new governance proposal.
     ///
     /// Only an `Admin` may create proposals. The proposal has an execution
@@ -811,6 +901,9 @@ impl DripGovernor {
             .set(&DataKey::Proposal(proposal_id), &proposal);
         env.storage()
             .instance()
+            .set(&DataKey::ProposalAbstainVotes(proposal_id), &0_u64);
+        env.storage()
+            .instance()
             .set(&DataKey::ProposalCounter, &proposal_id);
         storage::add_proposal_to_status_index(&env, proposal_id, storage::ProposalStatus::Pending);
         storage::set_proposal_snapshot_ledger(&env, proposal_id, snapshot_ledger);
@@ -853,7 +946,8 @@ impl DripGovernor {
     /// Fails with `TimelockNotMet` if the proposal has not elapsed MIN_EXECUTION_DELAY.
     /// Fails with `ProposalExpired` if the execution window has elapsed.
     /// Fails with `ProposalNotPending` if the proposal has been executed or cancelled.
-    /// Fails with `QuorumNotMet` if total votes (for_votes + against_votes) do not reach minimum quorum.
+    /// Fails with `QuorumNotMet` if participation (for, against, and abstain)
+    /// does not reach the minimum quorum.
     pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
         ttl::bump(&env);
 
@@ -887,12 +981,16 @@ impl DripGovernor {
                 .map(|s| s.total_supply)
                 .unwrap_or_else(|| Self::governance_supply(env.clone()));
             let quorum_threshold = (total_supply as u128 * min_quorum_bps as u128 / 10_000) as u64;
-            let total_votes = proposal.for_votes.saturating_add(proposal.against_votes);
+            let total_votes = proposal
+                .for_votes
+                .saturating_add(proposal.against_votes)
+                .saturating_add(storage::get_abstain_votes(&env, proposal_id));
             if total_votes < quorum_threshold {
                 return Err(Error::QuorumNotMet);
             }
         }
 
+        storage::archive_vote_record(&env, proposal_id, &proposal);
         storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Executed);
 
         Ok(())
@@ -922,8 +1020,36 @@ impl DripGovernor {
             return Err(Error::ProposalNotPending);
         }
 
+        storage::archive_vote_record(&env, proposal_id, &proposal);
         storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Cancelled);
 
+        Ok(())
+    }
+
+    /// Cancel a pending or active proposal in an emergency. Only an Admin may call this.
+    pub fn cancel_proposal_by_admin(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        ttl::bump(&env);
+
+        let proposal: storage::Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        if proposal.status != storage::ProposalStatus::Pending
+            && proposal.status != storage::ProposalStatus::Active
+        {
+            return Err(Error::ProposalNotPending);
+        }
+
+        storage::archive_vote_record(&env, proposal_id, &proposal);
+        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Cancelled);
+        events::proposal_cancelled_by_admin(&env, &caller, proposal_id, &reason_hash);
         Ok(())
     }
 
@@ -945,64 +1071,15 @@ impl DripGovernor {
         support: bool,
         rationale: Option<String>,
     ) -> Result<(), Error> {
-        voter.require_auth();
-        ttl::bump(&env);
+        cast_ballot(env, voter, proposal_id, Some(support), rationale)
+    }
 
-        if storage::has_voted(&env, proposal_id, &voter) {
-            return Err(Error::AlreadyVoted);
-        }
-
-        let mut proposal: storage::Proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(Error::ProposalNotFound)?;
-
-        if proposal.status != storage::ProposalStatus::Pending
-            && proposal.status != storage::ProposalStatus::Active
-        {
-            return Err(Error::ProposalNotPending);
-        }
-
-        let elapsed = env.ledger().timestamp().saturating_sub(proposal.created_at);
-        if elapsed
-            > proposal
-                .execution_window_secs
-                .saturating_add(Self::MIN_EXECUTION_DELAY)
-        {
-            return Err(Error::ProposalExpired);
-        }
-
-        let weight = match storage::get_checkpoint_weight(&env, &voter, proposal.snapshot_ledger) {
-            Some(0) => return Err(Error::InsufficientVotingWeight),
-            Some(w) => w,
-            None => 1,
-        };
-
-        if support {
-            proposal.for_votes = proposal.for_votes.saturating_add(weight);
-        } else {
-            proposal.against_votes = proposal.against_votes.saturating_add(weight);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Active);
-
-        let snapshot = storage::VoteTallySnapshot {
-            proposal_id,
-            snapshot_ledger: proposal.snapshot_ledger,
-            for_votes: proposal.for_votes,
-            against_votes: proposal.against_votes,
-            total_supply: storage::get_vote_tally_snapshot(&env, proposal_id)
-                .map(|s| s.total_supply)
-                .unwrap_or_else(|| Self::governance_supply(env.clone())),
-        };
-        storage::save_vote_tally_snapshot(&env, &snapshot);
-        storage::record_voter_receipt(&env, proposal_id, &voter, weight);
-
-        events::vote_cast(&env, &voter, proposal_id, support, rationale);
-        Ok(())
+    /// Cast an abstain ballot using the voter's checkpointed voting weight.
+    pub fn cast_abstain_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        cast_ballot(env, voter, proposal_id, None, None)
     }
 }

@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, IntoVal,
+    Address, BytesN, Env, IntoVal, Symbol,
 };
 
 fn create_test_env() -> (Env, Address, Address, Address) {
@@ -237,6 +237,10 @@ fn test_execute_proposal_enforces_quorum_threshold() {
 
     // Now execute succeeds!
     assert!(client.try_execute_proposal(&proposal_id).is_ok());
+    let record = client.get_vote_record(&proposal_id);
+    assert_eq!(record.for_votes, 1);
+    assert_eq!(record.against_votes, 1);
+    assert_eq!(record.abstain_votes, 0);
 }
 
 #[test]
@@ -320,6 +324,81 @@ fn test_proposal_vote_tally_snapshotting_prevents_double_vote_transfer() {
     assert_eq!(
         client.try_cast_vote(&wallet_b, &proposal_id, &true),
         Err(Ok(Error::InsufficientVotingWeight))
+    );
+}
+
+#[test]
+fn test_admin_cancellation_archives_votes_and_emits_reason_hash() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+    let proposal_id = client.propose(&authority, &3600);
+    let for_voter = Address::generate(&env);
+    let abstain_voter = Address::generate(&env);
+    client.cast_vote(&for_voter, &proposal_id, &true);
+    client.cast_abstain_vote(&abstain_voter, &proposal_id);
+
+    let reason_hash = BytesN::from_array(&env, &[7; 32]);
+    client.cancel_proposal_by_admin(&authority, &proposal_id, &reason_hash);
+
+    let record = client.get_vote_record(&proposal_id);
+    assert_eq!(record.for_votes, 1);
+    assert_eq!(record.against_votes, 0);
+    assert_eq!(record.abstain_votes, 1);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(
+        topics,
+        (
+            Symbol::new(&env, "ProposalCancelledByAdmin"),
+            proposal_id,
+            authority,
+        )
+            .into_val(&env)
+    );
+    assert_eq!(data, reason_hash.into_val(&env));
+}
+
+#[test]
+fn test_decaying_checkpoint_weights_are_used_at_proposal_snapshots() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+    let voter = Address::generate(&env);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+
+    // Checkpoint weights represent voting power as progressively shorter
+    // lock-ups decay; each proposal must use the weight at its own snapshot.
+    env.ledger().set_sequence_number(10);
+    client.checkpoint_balance(&authority, &voter, &300);
+    env.ledger().set_sequence_number(15);
+    let long_lock_proposal = client.propose(&authority, &3600);
+    client.cast_vote(&voter, &long_lock_proposal, &true);
+    assert_eq!(client.get_proposal(&long_lock_proposal).for_votes, 300);
+
+    env.ledger().set_sequence_number(20);
+    client.checkpoint_balance(&authority, &voter, &200);
+    env.ledger().set_sequence_number(25);
+    let medium_lock_proposal = client.propose(&authority, &3600);
+    client.cast_vote(&voter, &medium_lock_proposal, &false);
+    assert_eq!(
+        client.get_proposal(&medium_lock_proposal).against_votes,
+        200
+    );
+
+    env.ledger().set_sequence_number(30);
+    client.checkpoint_balance(&authority, &voter, &100);
+    env.ledger().set_sequence_number(35);
+    let short_lock_proposal = client.propose(&authority, &3600);
+    client.cast_abstain_vote(&voter, &short_lock_proposal);
+    let reason_hash = BytesN::from_array(&env, &[1; 32]);
+    client.cancel_proposal_by_admin(&authority, &short_lock_proposal, &reason_hash);
+    assert_eq!(
+        client.get_vote_record(&short_lock_proposal).abstain_votes,
+        100
     );
 }
 
@@ -466,6 +545,7 @@ fn proposals_are_indexed_by_status_transitions() {
         client.proposals_by_status(&ProposalStatus::Cancelled),
         soroban_sdk::vec![&env, third]
     );
+    assert_eq!(client.get_vote_record(&third).for_votes, 0);
     assert!(client
         .proposals_by_status(&ProposalStatus::Pending)
         .is_empty());

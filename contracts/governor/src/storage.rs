@@ -36,6 +36,15 @@ pub struct VoteTallySnapshot {
     pub total_supply: u64,
 }
 
+/// Immutable vote distribution archived when a proposal reaches a terminal state.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoteRecord {
+    pub for_votes: u64,
+    pub against_votes: u64,
+    pub abstain_votes: u64,
+}
+
 /// Minimal proposal struct for governance proposals.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +167,10 @@ pub enum DataKey {
     /// Maintained on every status transition so voting portals can paginate
     /// proposals for one status without scanning the whole `Proposal` map.
     ProposalsByStatus(ProposalStatus),
+    /// Archived vote distribution for a terminal proposal.
+    VoteRecord(u64),
+    /// Abstain-vote tally for proposal `u64`.
+    ProposalAbstainVotes(u64),
 }
 
 /// Adds `proposal_id` to the status index for `status` if it is not present.
@@ -224,6 +237,54 @@ pub fn set_proposal_status(env: &Env, proposal_id: u64, new_status: ProposalStat
     }
 
     true
+}
+
+/// Archives a proposal's vote distribution once in persistent storage.
+pub fn archive_vote_record(env: &Env, proposal_id: u64, proposal: &Proposal) {
+    let key = DataKey::VoteRecord(proposal_id);
+    let storage = env.storage().persistent();
+    if storage.has(&key) {
+        return;
+    }
+
+    let record = VoteRecord {
+        for_votes: proposal.for_votes,
+        against_votes: proposal.against_votes,
+        abstain_votes: get_abstain_votes(env, proposal_id),
+    };
+    storage.set(&key, &record);
+    drip_common::ttl::bump_persistent(env, &key);
+}
+
+/// Loads the archived vote distribution for a terminal proposal.
+pub fn get_vote_record(env: &Env, proposal_id: u64) -> Option<VoteRecord> {
+    let key = DataKey::VoteRecord(proposal_id);
+    let record = env.storage().persistent().get(&key);
+    if record.is_some() {
+        drip_common::ttl::bump_persistent(env, &key);
+    }
+    record
+}
+
+/// Adds `weight` to the proposal's abstain tally.
+pub fn add_abstain_votes(env: &Env, proposal_id: u64, weight: u64) -> u64 {
+    let key = DataKey::ProposalAbstainVotes(proposal_id);
+    let total = env
+        .storage()
+        .instance()
+        .get::<_, u64>(&key)
+        .unwrap_or(0)
+        .saturating_add(weight);
+    env.storage().instance().set(&key, &total);
+    total
+}
+
+/// Returns the current abstain tally for a proposal.
+pub fn get_abstain_votes(env: &Env, proposal_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ProposalAbstainVotes(proposal_id))
+        .unwrap_or(0)
 }
 
 /// Records a token balance checkpoint for `account` at the current ledger sequence.
