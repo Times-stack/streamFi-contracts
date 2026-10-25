@@ -14,12 +14,14 @@ use soroban_sdk::{
 /// entries (see `storage.rs` rule: unbounded per-entity data belongs in
 /// `persistent()`, not `instance()`), but even persistent growth must be
 /// bounded to keep aggregation within the transaction budget. 32 feeders is
-/// ample for a TWAP median and keeps `get_twap_price` well under budget
-/// (32 gets + insertion sort).
+/// ample for quorum checks and keeps `get_twap_price` well under budget.
 /// Standard precision scale for pair price calculations (8 decimals).
 pub const PRICE_PRECISION: u128 = 100_000_000;
 
 const MAX_SUBMITTERS: u32 = 32;
+
+/// Maximum number of recent price observations retained for sliding-window TWAPs.
+pub const MAX_TWAP_OBSERVATIONS: u32 = 32;
 
 /// Maximum number of reporters retained for any one pair feed.
 const MAX_PAIR_REPORTERS: u32 = 5;
@@ -86,14 +88,14 @@ pub enum DataKey {
     /// **Persistent storage.** Most recent submission from a single feeder,
     /// keyed by feeder address. Stored in `persistent()` (not `instance()`)
     /// per the `storage.rs` rule: unbounded per-entity data belongs in
-    /// `persistent()` to avoid instance bloat. Aggregated (median) across
-    /// every address in `Submitters` by `get_twap_price`, so no single
-    /// feeder's price is trusted alone. TTL extended on each `submit_price`.
+    /// `persistent()` to avoid instance bloat. The current cross-feeder median
+    /// is sampled into `PriceObservations`; `get_twap_price` uses this entry
+    /// for freshness and quorum checks. TTL is extended on each submission.
     Submission(Address),
     /// **Persistent storage.** Every address that has called `submit_price`,
-    /// iterated by `get_twap_price` to build the aggregation set. Stored in
-    /// `persistent()` with TTL extension; capped at [`MAX_SUBMITTERS`] so
-    /// aggregation stays bounded (one `get` per entry).
+    /// iterated to form cross-feeder observations and enforce quorum in
+    /// `get_twap_price`. Stored in `persistent()` with TTL extension; capped
+    /// at [`MAX_SUBMITTERS`] so aggregation stays bounded.
     Submitters,
     /// Index of all accounts currently holding a given role.
     ///
@@ -135,6 +137,9 @@ pub enum DataKey {
     /// stablecoins versus volatile assets — can set independent staleness
     /// tolerances instead of sharing the single global `max_staleness`.
     AssetOracleConfig(Address),
+    /// **Persistent storage.** The bounded rolling history of submitted prices
+    /// used to calculate sliding-window time-weighted averages.
+    PriceObservations,
 }
 
 /// Per-token oracle configuration.
@@ -225,6 +230,14 @@ pub struct PriceData {
     pub updated_at: u64,
 }
 
+/// One accepted price observation used by the sliding-window TWAP.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceObservation {
+    pub price: u64,
+    pub timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PairPriceData {
@@ -232,26 +245,23 @@ pub struct PairPriceData {
     pub updated_at: u64,
 }
 
-/// Aggregated price health, computed from the same per-feeder submission set
-/// that [`get_twap_price`](TwapOracle::get_twap_price) aggregates, so these
-/// metrics can never disagree with the median it returns.
+/// Aggregated price health, computed from the per-feeder submissions that
+/// [`get_twap_price`](TwapOracle::get_twap_price) uses for freshness and quorum.
 ///
 /// The old `price_age` / `is_price_stale` views keyed off the legacy
 /// single-value `DataKey::Price` scalar, which `submit_price` overwrites with
 /// whichever feeder submitted last. That let one fresh feeder make the whole
-/// price look fresh while the TWAP median was dominated by other feeders'
-/// older-but-still-fresh values — a number materially different from the
-/// "latest price" a UI showed next to a green indicator. Callers also had no
-/// way to see the quorum (how many distinct feeders contributed) or the spread
-/// of submission ages behind the value they were about to read.
+/// price look fresh while other feeders had older-but-still-fresh values.
+/// Callers also had no way to see the quorum (how many distinct feeders
+/// contributed) or the spread of submission ages behind the value they read.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceStatus {
     /// Number of distinct feeders whose most-recent submission is still within
-    /// `max_staleness` and non-zero — exactly the set `get_twap_price`'s
-    /// median is computed over. A caller can use this as a quorum indicator:
+    /// `max_staleness` and non-zero — exactly the set used by
+    /// `get_twap_price`'s quorum check. A caller can use this as an indicator:
     /// `1` means no diversification (any single feeder drives the price),
-    /// while several mean the median is genuinely cross-feeder.
+    /// while several mean the current observations are cross-feeder backed.
     pub fresh_submitter_count: u32,
     /// The configured minimum-submitter quorum
     /// (`OracleConfig::min_submitters`) — the reliability threshold
@@ -260,11 +270,11 @@ pub struct PriceStatus {
     /// otherwise `get_twap_price` errors with `InsufficientQuorum` (issue
     /// #661).
     pub min_submitters: u32,
-    /// Age in seconds of the newest fresh submission (the youngest individual
-    /// observation contributing to the median). `0` when `stale` is `true`.
+    /// Age in seconds of the newest fresh feeder submission. `0` when `stale`
+    /// is `true`.
     pub newest_age: u64,
-    /// Age in seconds of the oldest fresh submission (how old the stalest
-    /// observation contributing to the median is). `0` when `stale` is `true`.
+    /// Age in seconds of the oldest fresh feeder submission. `0` when `stale`
+    /// is `true`.
     /// Together with `newest_age`, this exposes the spread in the aggregation
     /// window so a caller can judge how tightly clustered the fresh values are.
     pub oldest_fresh_age: u64,
@@ -312,8 +322,7 @@ pub enum Error {
     /// exceed the capped submitter set (issue #661).
     InvalidMinSubmitters = 1019,
     /// `get_twap_price` found fewer fresh, non-zero feeder submissions than
-    /// the configured `min_submitters` quorum requires, so the TWAP median is
-    /// not reliable enough to return (issue #661).
+    /// the configured `min_submitters` quorum requires (issue #661).
     InsufficientQuorum = 1020,
     /// The WASM hash provided to `upgrade` is all zeros (invalid).
     InvalidWasmHash = 1021,
@@ -332,6 +341,8 @@ pub enum Error {
     /// A per-asset heartbeat timeout of zero was configured. A zero timeout
     /// would make every report stale immediately (Issue #850).
     InvalidHeartbeatTimeout = 1028,
+    /// TWAP observation count must be between one and `MAX_TWAP_OBSERVATIONS`.
+    InvalidObservationCount = 1029,
 }
 
 #[contract]
@@ -477,7 +488,7 @@ impl TwapOracle {
     ///     submissions before they corrupt the TWAP window (#226).
     ///   - `min_submitters`: Minimum number of distinct feeders whose fresh
     ///     submissions must back the TWAP before
-    ///     [`get_twap_price`](Self::get_twap_price) returns a median. Below
+    ///     [`get_twap_price`](Self::get_twap_price) returns a price. Below
     ///     this quorum the read errors with `Error::InsufficientQuorum`
     ///     (issue #661).
     ///
@@ -485,9 +496,10 @@ impl TwapOracle {
     ///
     /// When `decimals` or `asset_peg` changes relative to the currently stored
     /// config, all existing price data (`DataKey::Price`, per-feeder
-    /// `DataKey::Submission` entries, and the `DataKey::Submitters` list) is
-    /// cleared. This prevents stale prices submitted under the old config from
-    /// being silently misinterpreted under the new parameters — the next
+    /// `DataKey::Submission` entries, the `DataKey::Submitters` list, and the
+    /// `DataKey::PriceObservations` history) is cleared. This prevents stale
+    /// prices submitted under the old config from being silently
+    /// misinterpreted under the new parameters — the next
     /// `get_twap_price` call will return `NoPriceAvailable` until a fresh
     /// `submit_price` is made. Changes to `max_staleness` alone do not clear
     /// price data, as those do not affect price magnitude interpretation.
@@ -583,15 +595,10 @@ impl TwapOracle {
     /// so submissions must use the same scale as the currently configured
     /// `decimals` or downstream payouts will be wrong by that scale factor.
     ///
-    /// There is no fixed time-bucketed TWAP window. Instead, every
-    /// feeder's most recent submission is kept independently
-    /// (`DataKey::Submission` in `persistent()`) and `get_twap_price`
-    /// aggregates the median (or the average of the two middle values, on an
-    /// even count) across every submission still within `max_staleness`
-    /// seconds of the current ledger time — see `get_twap_price` for the
-    /// aggregation logic and `OracleConfig::max_staleness` for the staleness
-    /// window. `Submitters` is capped at [`MAX_SUBMITTERS`] so aggregation
-    /// stays bounded.
+    /// Each accepted submission is also recorded in a bounded rolling history
+    /// (`DataKey::PriceObservations`), which `get_twap_price` uses to smooth
+    /// price changes over time. The per-feeder submissions remain available
+    /// for freshness and minimum-submitter quorum checks.
     ///
     /// Blocked while the oracle is under an emergency pause. Each feeder's
     /// submission is tracked independently (`DataKey::Submission`) and
@@ -704,6 +711,8 @@ impl TwapOracle {
             .set(&DataKey::Submission(caller.clone()), &data);
         ttl::bump_persistent(&env, &DataKey::Submission(caller.clone()));
         add_submitter(&env, &caller)?;
+        let aggregate = current_submission_median(&env, price, now);
+        record_price_observation(&env, aggregate, now)?;
 
         events::price_submitted(&env, &caller, price, now);
         Ok(())
@@ -711,10 +720,9 @@ impl TwapOracle {
 
     /// Returns the current oracle price, guarded against re-entrancy.
     ///
-    /// Aggregates every non-stale submission across all addresses that have
-    /// ever called `submit_price` (median, or the average of the two
-    /// middle values when there is an even count) rather than trusting the
-    /// single most recent submitter unconditionally — see issue #194.
+    /// Returns a time-weighted average of the most recent accepted price
+    /// observations, subject to the existing feeder freshness and quorum
+    /// checks. At most [`MAX_TWAP_OBSERVATIONS`] observations are retained.
     ///
     /// Errors:
     /// - `OracleNotConfigured` if `configure_oracle` has not been called.
@@ -727,10 +735,26 @@ impl TwapOracle {
     /// - `OracleLocked` if called while the re-entrancy guard is already held
     ///   (see the nested-lock warning on `calculate_fiat_stream_payout`).
     pub fn get_twap_price(env: Env) -> Result<u64, Error> {
-        with_guard(&env, || Self::get_twap_price_inner(env.clone()))
+        with_guard(&env, || {
+            Self::get_twap_price_inner(env.clone(), MAX_TWAP_OBSERVATIONS)
+        })
     }
 
-    fn get_twap_price_inner(env: Env) -> Result<u64, Error> {
+    /// Returns the time-weighted average over at most `observation_count`
+    /// recent submissions. If fewer observations exist, all available
+    /// observations are used. The count must be in `1..=MAX_TWAP_OBSERVATIONS`.
+    pub fn get_twap_price_for_observations(
+        env: Env,
+        observation_count: u32,
+    ) -> Result<u64, Error> {
+        with_guard(&env, || Self::get_twap_price_inner(env.clone(), observation_count))
+    }
+
+    fn get_twap_price_inner(env: Env, observation_count: u32) -> Result<u64, Error> {
+        if observation_count == 0 || observation_count > MAX_TWAP_OBSERVATIONS {
+            return Err(Error::InvalidObservationCount);
+        }
+
         let config: OracleConfig = env
             .storage()
             .instance()
@@ -741,7 +765,13 @@ impl TwapOracle {
             || env.storage().instance().has(&DataKey::FallbackOracle)
         {
             if let Ok(price) = resolve_oracle_with_failover(&env, config.max_staleness) {
-                return Ok(price.price);
+                return record_and_calculate_twap(
+                    &env,
+                    price.price,
+                    price.updated_at,
+                    observation_count,
+                    config.max_staleness,
+                );
             }
         }
 
@@ -769,7 +799,13 @@ impl TwapOracle {
 
         if fresh_prices.is_empty() {
             if let Ok(fallback_data) = resolve_oracle_with_failover(&env, config.max_staleness) {
-                return Ok(fallback_data.price);
+                return record_and_calculate_twap(
+                    &env,
+                    fallback_data.price,
+                    fallback_data.updated_at,
+                    observation_count,
+                    config.max_staleness,
+                );
             }
             if saw_any_submission {
                 return Err(Error::OracleStalePrice);
@@ -777,18 +813,29 @@ impl TwapOracle {
             return Err(Error::NoPriceAvailable);
         }
 
-        // Enforce the minimum-submitter quorum (issue #661): a median computed
-        // from fewer fresh feeders than `min_submitters` is not reliable
-        // enough to return. `PriceStatus` exposes both counts so callers can
-        // observe how far below quorum the set is.
+        // Enforce the minimum-submitter quorum (issue #661) before using the
+        // observation history. `PriceStatus` exposes the same freshness counts.
         if fresh_prices.len() < config.min_submitters {
             if let Ok(fallback_data) = resolve_oracle_with_failover(&env, config.max_staleness) {
-                return Ok(fallback_data.price);
+                return record_and_calculate_twap(
+                    &env,
+                    fallback_data.price,
+                    fallback_data.updated_at,
+                    observation_count,
+                    config.max_staleness,
+                );
             }
             return Err(Error::InsufficientQuorum);
         }
 
-        Ok(median(fresh_prices))
+        match calculate_twap(&env, observation_count, config.max_staleness) {
+            Ok(price) => Ok(price),
+            // A newly initialized feed can receive several observations in a
+            // single ledger timestamp. With no elapsed time to weight yet,
+            // retain the prior multi-feeder median behavior until time passes.
+            Err(Error::NoPriceAvailable) => Ok(median(fresh_prices)),
+            Err(err) => Err(err),
+        }
     }
 
     /// Configures both the `primary_oracle` and optional `fallback_oracle` feed addresses.
@@ -867,7 +914,7 @@ impl TwapOracle {
             {
                 return resolve_oracle_with_failover(&env, max_staleness).map(|d| d.price);
             }
-            Self::get_twap_price_inner(env.clone())
+            Self::get_twap_price_inner(env.clone(), MAX_TWAP_OBSERVATIONS)
         })
     }
 
@@ -1110,7 +1157,8 @@ impl TwapOracle {
     }
 
     fn calculate_fiat_stream_payout_inner(env: Env, token_amount: u64) -> Result<u64, Error> {
-        let current_price = Self::get_twap_price_inner(env.clone())?;
+        let current_price =
+            Self::get_twap_price_inner(env.clone(), MAX_TWAP_OBSERVATIONS)?;
 
         let config: OracleConfig = env
             .storage()
@@ -1466,6 +1514,9 @@ fn store_oracle_config(env: &Env, caller: &Address, config: OracleConfig) -> Res
                     .remove(&DataKey::Submission(feeder));
             }
             env.storage().persistent().remove(&DataKey::Submitters);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PriceObservations);
         }
     }
 
@@ -1816,6 +1867,145 @@ fn add_submitter(env: &Env, account: &Address) -> Result<(), Error> {
         .set(&DataKey::Submitters, &submitters);
     ttl::bump_persistent(env, &DataKey::Submitters);
     Ok(())
+}
+
+fn current_submission_median(env: &Env, fallback_price: u64, now: u64) -> u64 {
+    let Some(config) = env
+        .storage()
+        .instance()
+        .get::<_, OracleConfig>(&DataKey::Config)
+    else {
+        return fallback_price;
+    };
+    let submitters: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Submitters)
+        .unwrap_or(Vec::new(env));
+    let mut fresh_prices = Vec::new(env);
+    for feeder in submitters.iter() {
+        if let Some(data) = env
+            .storage()
+            .persistent()
+            .get::<_, PriceData>(&DataKey::Submission(feeder))
+        {
+            if now.saturating_sub(data.updated_at) <= config.max_staleness && data.price != 0 {
+                fresh_prices.push_back(data.price);
+            }
+        }
+    }
+    if fresh_prices.is_empty() {
+        fallback_price
+    } else {
+        median(fresh_prices)
+    }
+}
+
+fn record_price_observation(env: &Env, price: u64, timestamp: u64) -> Result<(), Error> {
+    let key = DataKey::PriceObservations;
+    let mut observations: Vec<PriceObservation> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+
+    let len = observations.len();
+    let observation = PriceObservation { price, timestamp };
+    if len > 0 {
+        let latest = observations.get(len - 1).unwrap();
+        if timestamp < latest.timestamp {
+            return Err(Error::StalePriceFeed);
+        }
+        if latest.timestamp == timestamp {
+            observations.set(len - 1, observation);
+            env.storage().persistent().set(&key, &observations);
+            ttl::bump_persistent(env, &key);
+            return Ok(());
+        }
+    }
+
+    if len == MAX_TWAP_OBSERVATIONS {
+        let mut retained = Vec::new(env);
+        let mut index = 1;
+        while index < len {
+            retained.push_back(observations.get(index).unwrap());
+            index += 1;
+        }
+        observations = retained;
+    }
+    observations.push_back(observation);
+    env.storage().persistent().set(&key, &observations);
+    ttl::bump_persistent(env, &key);
+    Ok(())
+}
+
+fn record_and_calculate_twap(
+    env: &Env,
+    price: u64,
+    timestamp: u64,
+    observation_count: u32,
+    max_staleness: u64,
+) -> Result<u64, Error> {
+    record_price_observation(env, price, timestamp)?;
+    match calculate_twap(env, observation_count, max_staleness) {
+        Ok(twap) => Ok(twap),
+        Err(Error::NoPriceAvailable) => Ok(price),
+        Err(err) => Err(err),
+    }
+}
+
+fn calculate_twap(
+    env: &Env,
+    observation_count: u32,
+    max_staleness: u64,
+) -> Result<u64, Error> {
+    let observations: Vec<PriceObservation> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PriceObservations)
+        .unwrap_or(Vec::new(env));
+    let len = observations.len();
+    if len == 0 {
+        return Err(Error::NoPriceAvailable);
+    }
+
+    let first = len.saturating_sub(observation_count);
+    let now = env.ledger().timestamp();
+    let mut weighted_price = 0u128;
+    let mut total_duration = 0u64;
+    let mut index = first;
+    while index < len {
+        let observation = observations.get(index).unwrap();
+        let next_timestamp = if index + 1 < len {
+            observations.get(index + 1).unwrap().timestamp
+        } else {
+            now
+        };
+        let valid_until = next_timestamp
+            .min(now)
+            .min(observation.timestamp.saturating_add(max_staleness));
+        let duration = valid_until.saturating_sub(observation.timestamp);
+        weighted_price = weighted_price
+            .checked_add(
+                (observation.price as u128)
+                    .checked_mul(duration as u128)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        total_duration = total_duration
+            .checked_add(duration)
+            .ok_or(Error::ArithmeticOverflow)?;
+        index += 1;
+    }
+
+    if total_duration == 0 {
+        return Err(Error::NoPriceAvailable);
+    }
+    let price = weighted_price / total_duration as u128;
+    if price > u64::MAX as u128 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    Ok(price as u64)
 }
 
 /// Removes `account` from `Submitters` and deletes `DataKey::Submission(account)`.
@@ -2838,6 +3028,41 @@ mod tests {
     // ── Multi-feeder aggregation tests (#194) ─────────────────────────────
 
     #[test]
+    fn get_twap_price_weights_the_recent_observation_window_by_time() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
+        client.configure_oracle(
+            &admin,
+            &OracleConfig {
+                decimals: 8,
+                asset_peg: 1,
+                max_staleness: 300,
+                max_price: 0,
+                min_submit_interval: 0,
+                min_submitters: 1,
+            },
+        );
+
+        env.ledger().set_timestamp(100);
+        client.submit_price(&admin, &100);
+        env.ledger().set_timestamp(110);
+        client.submit_price(&admin, &200);
+        env.ledger().set_timestamp(140);
+
+        assert_eq!(client.get_twap_price(), 175);
+        assert_eq!(client.get_twap_price_for_observations(&1), 200);
+        assert_eq!(
+            client.try_get_twap_price_for_observations(&0),
+            Err(Ok(Error::InvalidObservationCount))
+        );
+        assert_eq!(
+            client.try_get_twap_price_for_observations(&(MAX_TWAP_OBSERVATIONS + 1)),
+            Err(Ok(Error::InvalidObservationCount))
+        );
+    }
+
+    #[test]
     fn get_twap_price_aggregates_median_across_feeders() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
@@ -3131,8 +3356,9 @@ mod tests {
         assert_eq!(status.newest_age, 0);
         assert_eq!(status.oldest_fresh_age, 100);
 
-        // The quorum is visible: this is a genuine 3-feeder median.
-        assert_eq!(client.get_twap_price(), 200_000_000);
+        // The per-feeder median snapshots at 0, 50, and 100 seconds produce a
+        // time-weighted average of 125 over the first 100 seconds.
+        assert_eq!(client.get_twap_price(), 125_000_000);
     }
 
     #[test]
@@ -3194,7 +3420,9 @@ mod tests {
         client.submit_price(&f1, &240_000_000);
         let status = client.price_status();
         assert_eq!(status.fresh_submitter_count, 2);
-        assert_eq!(client.get_twap_price(), 245_000_000);
+        // The previous $150 TWAP remains the weighted price until the fresh
+        // submissions at the current timestamp accrue elapsed time.
+        assert_eq!(client.get_twap_price(), 150_000_000);
     }
 
     #[test]
@@ -3237,7 +3465,7 @@ mod tests {
         // One fresh feeder -> neither is stale, and a price is readable.
         client.submit_price(&f2, &250_000_000);
         assert!(!client.is_price_stale());
-        assert_eq!(client.get_twap_price(), 250_000_000);
+        assert_eq!(client.get_twap_price(), 150_000_000);
     }
 
     // ── TTL extension tests (#189) ──────────────────────────────────────
@@ -3602,8 +3830,9 @@ mod tests {
             "submit after exactly min_submit_interval must succeed"
         );
 
-        // Updated price is now reflected in the TWAP.
-        assert_eq!(client.get_twap_price(), 200_000_000);
+        // The original $100 observation held for the elapsed minute; the new
+        // $200 observation has not accrued time yet.
+        assert_eq!(client.get_twap_price(), 100_000_000);
     }
 
     #[test]

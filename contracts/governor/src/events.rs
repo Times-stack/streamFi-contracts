@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, Address, Env, Symbol};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, Symbol};
 
 use crate::Role;
 
@@ -180,6 +180,31 @@ pub fn vote_cast(
     env.events().publish(
         (symbol_short!("vote"), voter.clone(), proposal_id),
         (support, rationale),
+    );
+}
+
+/// Emitted when a voter casts an abstain ballot.
+pub fn vote_abstain_cast(env: &Env, voter: &Address, proposal_id: u64) {
+    env.events().publish(
+        (Symbol::new(env, "vote_abstain"), voter.clone(), proposal_id),
+        (),
+    );
+}
+
+/// Emitted when an Admin cancels a proposal, with a hash of the rationale.
+pub fn proposal_cancelled_by_admin(
+    env: &Env,
+    caller: &Address,
+    proposal_id: u64,
+    reason_hash: &BytesN<32>,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "ProposalCancelledByAdmin"),
+            proposal_id,
+            caller.clone(),
+        ),
+        reason_hash.clone(),
     );
 }
 
