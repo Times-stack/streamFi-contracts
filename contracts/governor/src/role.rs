@@ -126,14 +126,20 @@ pub fn require_executor(env: &Env, caller: &Address) -> Result<(), Error> {
 /// The result is capped at 100 members and includes the total member count.
 pub fn role_members(env: &Env, role: Role, offset: u32, limit: u32) -> RoleMembersPage {
     let all_members = rbac::role_members(env, &members_key(role));
-    let total = all_members.len();
+    let mut active_members = Vec::new(env);
+    for account in all_members.iter() {
+        if has_role(env, role, &account) {
+            active_members.push_back(account);
+        }
+    }
+    let total = active_members.len();
     let start = offset.min(total);
     let end = start
         .saturating_add(limit.min(MAX_ROLE_MEMBERS_PAGE_SIZE))
         .min(total);
     let mut members = Vec::new(env);
     for index in start..end {
-        members.push_back(all_members.get(index).unwrap());
+        members.push_back(active_members.get(index).unwrap());
     }
     RoleMembersPage { members, total }
 }
