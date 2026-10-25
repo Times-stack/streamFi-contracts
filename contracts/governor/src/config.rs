@@ -1,5 +1,7 @@
 use soroban_sdk::{contracttype, Address, Env};
 
+use drip_common::is_zero_address;
+
 use crate::storage::DataKey;
 use crate::Error;
 
@@ -25,6 +27,10 @@ pub struct GovernorConfig {
     pub min_quorum_bps: u32,
     /// Minimum voting period in ledger sequences (Issue #772).
     pub voting_period_ledgers: u32,
+    /// Token address used to escrow proposal stake, if configured.
+    pub proposal_stake_token: Option<Address>,
+    /// Minimum token amount required to create a proposal.
+    pub min_proposal_stake: i128,
 }
 
 /// Load the governor configuration from instance storage.
@@ -53,6 +59,8 @@ pub fn load(env: &Env) -> Result<GovernorConfig, Error> {
         force_cancel_pause_secs: s.get(&DataKey::ForceCancelPauseSecs).unwrap_or(2_592_000), // 30 days
         min_quorum_bps: s.get(&DataKey::MinQuorumBps).unwrap_or(0),
         voting_period_ledgers: s.get(&DataKey::VotingPeriodLedgers).unwrap_or(MIN_VOTING_PERIOD_LEDGERS),
+        proposal_stake_token: s.get(&DataKey::ProposalStakeToken),
+        min_proposal_stake: s.get(&DataKey::MinProposalStake).unwrap_or(0),
     })
 }
 
@@ -74,4 +82,19 @@ pub fn get_voting_period(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::VotingPeriodLedgers)
         .unwrap_or(MIN_VOTING_PERIOD_LEDGERS)
+}
+
+/// Validate and store a proposal token stake threshold.
+pub fn set_proposal_stake_config(
+    env: &Env,
+    token: &Address,
+    min_stake: i128,
+) -> Result<(), Error> {
+    if min_stake <= 0 || is_zero_address(env, token) {
+        return Err(Error::InvalidParam);
+    }
+    let storage = env.storage().instance();
+    storage.set(&DataKey::ProposalStakeToken, token);
+    storage.set(&DataKey::MinProposalStake, &min_stake);
+    Ok(())
 }

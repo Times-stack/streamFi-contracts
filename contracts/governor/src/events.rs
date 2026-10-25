@@ -220,6 +220,18 @@ pub fn set_min_quorum_bps(
     );
 }
 
+pub fn set_proposal_stake_config(
+    env: &Env,
+    caller: &Address,
+    token: &Address,
+    min_stake: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "proposal_stake"), caller.clone()),
+        (token.clone(), min_stake),
+    );
+}
+
 /// Emitted when a proposal is queued for execution after passing quorum and vote threshold.
 /// Records the proposal ID and the execution window deadline (timestamp when execution becomes valid).
 #[allow(dead_code)]

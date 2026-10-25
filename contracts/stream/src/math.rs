@@ -1,7 +1,28 @@
-use soroban_sdk::Env;
+use soroban_sdk::{Env, U256};
 
 use crate::errors::Error;
 use crate::storage::{CliffConfig, DataKey, RateCheckpoint, StreamInfo};
+
+/// Calculates `value * multiplier / divisor` without overflowing an i128
+/// intermediate. Inputs and the result are non-negative.
+pub fn mul_div(
+    env: &Env,
+    value: i128,
+    multiplier: u128,
+    divisor: u128,
+) -> Result<i128, Error> {
+    if value < 0 || divisor == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+
+    let result = U256::from_u128(env, value as u128)
+        .mul(&U256::from_u128(env, multiplier))
+        .div(&U256::from_u128(env, divisor))
+        .to_u128()
+        .and_then(|value| i128::try_from(value).ok())
+        .ok_or(Error::ArithmeticOverflow)?;
+    Ok(result)
+}
 
 /// Returns the total tokens that have streamed up to `now`,
 /// excluding any paused time. Does not account for withdrawals.
@@ -56,10 +77,7 @@ pub fn streamed_amount(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
         let elapsed = effective_now
             .checked_sub(checkpoint.at)
             .ok_or(Error::ArithmeticOverflow)?;
-        let linear = info
-            .rate_per_second
-            .checked_mul(elapsed as i128)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let linear = mul_div(env, info.rate_per_second, elapsed as u128, 1)?;
         return checkpoint
             .accrued
             .checked_add(linear)
@@ -75,9 +93,7 @@ pub fn streamed_amount(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
         let elapsed = effective_now
             .checked_sub(cfg.cliff_time)
             .ok_or(Error::ArithmeticOverflow)?;
-        let linear = (info.rate_per_second)
-            .checked_mul(elapsed as i128)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let linear = mul_div(env, info.rate_per_second, elapsed as u128, 1)?;
         return cfg
             .cliff_unlock_amount
             .checked_add(linear)
@@ -88,7 +104,7 @@ pub fn streamed_amount(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
         .checked_sub(info.start_time)
         .ok_or(Error::ArithmeticOverflow)?;
 
-    calculate_streamed_amount(info.rate_per_second, elapsed)
+    mul_div(env, info.rate_per_second, elapsed as u128, 1)
 }
 
 /// Calculates linear streamed amount: `rate_per_second * elapsed`, returning `Error::ArithmeticOverflow` on overflow (Issue #681).

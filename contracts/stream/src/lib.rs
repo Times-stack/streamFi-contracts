@@ -71,6 +71,39 @@ fn require_sender_or_operator(env: &Env, caller: &Address, sender: &Address) -> 
     }
 }
 
+fn auto_forward_address(env: &Env, recipient: &Address) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::AutoForwardAddress)
+        .unwrap_or_else(|| recipient.clone())
+}
+
+fn cumulative_deposited(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
+    if let Some(total) = env
+        .storage()
+        .instance()
+        .get(&DataKey::CumulativeDeposited)
+    {
+        return Ok(total);
+    }
+
+    let token = token::Client::new(env, &info.token);
+    token
+        .balance(&env.current_contract_address())
+        .checked_add(info.withdrawn)
+        .ok_or(Error::ArithmeticOverflow)
+}
+
+fn add_cumulative_deposit(env: &Env, info: &StreamInfo, amount: i128) -> Result<(), Error> {
+    let total = cumulative_deposited(env, info)?
+        .checked_add(amount)
+        .ok_or(Error::ArithmeticOverflow)?;
+    env.storage()
+        .instance()
+        .set(&DataKey::CumulativeDeposited, &total);
+    Ok(())
+}
+
 /// Re-entrancy guard audit (issue #442)
 ///
 /// Every state-mutating `#[contractimpl]` entry point below goes through
@@ -228,6 +261,12 @@ impl DripStream {
                 recipient: recipient.clone(),
             },
         );
+        let initial_deposit = if end_time > 0 {
+            rate_per_second * (end_time - start_time) as i128
+        } else {
+            token::Client::new(&env, &token).balance(&env.current_contract_address())
+        };
+        s.set(&DataKey::CumulativeDeposited, &initial_deposit);
 
         // Write the initial state before emitting the creation event so the
         // event sequence lives with the consolidated `Config` payload from the
@@ -304,6 +343,7 @@ impl DripStream {
 
         let tk = token::Client::new(env, &info.token);
         let contract_addr = env.current_contract_address();
+        let payout_recipient = auto_forward_address(env, &info.recipient);
 
         // Clamp the payout to the real tokens the contract actually holds.
         // For an open-ended stream (`end_time == 0`) accrual is unbounded while
@@ -336,16 +376,14 @@ impl DripStream {
         // Perform the transfer, then derive `remaining` from the single balance
         let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
         if let Some(split) = split_opt {
-            let secondary_amount = to_send
-                .checked_mul(split.split_bps as i128)
-                .ok_or(Error::ArithmeticOverflow)?
-                / 10_000;
+            let secondary_amount =
+                math::mul_div(env, to_send, split.split_bps as u128, 10_000)?;
             let primary_amount = to_send
                 .checked_sub(secondary_amount)
                 .ok_or(Error::ArithmeticOverflow)?;
 
             if primary_amount > 0 {
-                tk.transfer(&contract_addr, &info.recipient, &primary_amount);
+                tk.transfer(&contract_addr, &payout_recipient, &primary_amount);
             }
             if secondary_amount > 0 {
                 tk.transfer(
@@ -355,7 +393,7 @@ impl DripStream {
                 );
             }
         } else {
-            tk.transfer(&contract_addr, &info.recipient, &to_send);
+            tk.transfer(&contract_addr, &payout_recipient, &to_send);
         }
 
         let now = env.ledger().timestamp();
@@ -453,15 +491,14 @@ impl DripStream {
             let split_opt: Option<SplitConfig> =
                 env.storage().instance().get(&DataKey::SplitConfig);
             if let Some(split) = split_opt {
-                let secondary_amount = owed_to_recipient
-                    .checked_mul(split.split_bps as i128)
-                    .ok_or(Error::ArithmeticOverflow)?
-                    / 10_000;
+                let secondary_amount =
+                    math::mul_div(env, owed_to_recipient, split.split_bps as u128, 10_000)?;
                 let primary_amount = owed_to_recipient
                     .checked_sub(secondary_amount)
                     .ok_or(Error::ArithmeticOverflow)?;
+                let payout_recipient = auto_forward_address(env, &info.recipient);
                 if primary_amount > 0 {
-                    tk.transfer(&contract_addr, &info.recipient, &primary_amount);
+                    tk.transfer(&contract_addr, &payout_recipient, &primary_amount);
                 }
                 if secondary_amount > 0 {
                     tk.transfer(
@@ -471,7 +508,8 @@ impl DripStream {
                     );
                 }
             } else {
-                tk.transfer(&contract_addr, &info.recipient, &owed_to_recipient);
+                let payout_recipient = auto_forward_address(env, &info.recipient);
+                tk.transfer(&contract_addr, &payout_recipient, &owed_to_recipient);
             }
         }
 
@@ -771,6 +809,7 @@ impl DripStream {
         // or operator), not always `info.sender`: SEP-41 `transfer` requires
         // the `from` address's own auth, which an operator acting alone
         // cannot supply on the sender's behalf.
+        add_cumulative_deposit(env, &info, amount)?;
         tk.transfer(caller, &contract_addr, &amount);
 
         let new_balance = tk.balance(&contract_addr);
@@ -828,6 +867,7 @@ impl DripStream {
 
         // Transfer required deposit from the caller (sender or operator) into
         // the contract. See `_top_up` for why this isn't always `info.sender`.
+        add_cumulative_deposit(env, &info, required_deposit)?;
         tk.transfer(caller, &contract_addr, &required_deposit);
 
         // Update end_time with overflow check
@@ -906,6 +946,7 @@ impl DripStream {
 
         // Transfer funds from the caller (sender or operator) into the
         // contract. See `_top_up` for why this isn't always `info.sender`.
+        add_cumulative_deposit(env, &info, amount)?;
         tk.transfer(caller, &contract_addr, &amount);
 
         // Update end_time with overflow check
@@ -1252,10 +1293,8 @@ impl DripStream {
 
         let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
         if let Some(split) = split_opt {
-            let secondary_amount = to_send
-                .checked_mul(split.split_bps as i128)
-                .ok_or(Error::ArithmeticOverflow)?
-                / 10_000;
+            let secondary_amount =
+                math::mul_div(env, to_send, split.split_bps as u128, 10_000)?;
             to_send
                 .checked_sub(secondary_amount)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1343,15 +1382,14 @@ impl DripStream {
             let split_opt: Option<SplitConfig> =
                 env.storage().instance().get(&DataKey::SplitConfig);
             if let Some(split) = split_opt {
-                let secondary_amount = owed_to_recipient
-                    .checked_mul(split.split_bps as i128)
-                    .ok_or(Error::ArithmeticOverflow)?
-                    / 10_000;
+                let secondary_amount =
+                    math::mul_div(env, owed_to_recipient, split.split_bps as u128, 10_000)?;
                 let primary_amount = owed_to_recipient
                     .checked_sub(secondary_amount)
                     .ok_or(Error::ArithmeticOverflow)?;
+                let payout_recipient = auto_forward_address(env, &info.recipient);
                 if primary_amount > 0 {
-                    tk.transfer(&contract_addr, &info.recipient, &primary_amount);
+                    tk.transfer(&contract_addr, &payout_recipient, &primary_amount);
                 }
                 if secondary_amount > 0 {
                     tk.transfer(
@@ -1361,7 +1399,8 @@ impl DripStream {
                     );
                 }
             } else {
-                tk.transfer(&contract_addr, &info.recipient, &owed_to_recipient);
+                let payout_recipient = auto_forward_address(env, &info.recipient);
+                tk.transfer(&contract_addr, &payout_recipient, &owed_to_recipient);
             }
         }
         if refund_to_sender > 0 {
@@ -1412,8 +1451,49 @@ impl DripStream {
         let mut updated = info.clone();
         updated.recipient = new_recipient.clone();
         state::save(env, &updated);
+        env.storage().instance().remove(&DataKey::AutoForwardAddress);
         events::recipient_transferred(env, &info.recipient, &new_recipient);
         Ok(())
+    }
+
+    /// Set the address that receives future payouts for this stream.
+    ///
+    /// Only the current recipient can configure forwarding. Passing the
+    /// recipient's own address disables forwarding.
+    pub fn set_auto_forward_address(env: Env, address: Address) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            ttl::bump(env);
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+            info.recipient.require_auth();
+
+            if is_zero_address(env, &address) {
+                return Err(Error::InvalidRecipient);
+            }
+            if address == info.recipient {
+                env.storage().instance().remove(&DataKey::AutoForwardAddress);
+            } else {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AutoForwardAddress, &address);
+            }
+            Ok(())
+        })
+    }
+
+    /// Read-only: get the recipient's configured payout forwarding address.
+    pub fn auto_forward_address(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AutoForwardAddress)
+    }
+
+    /// Read-only: get the total amount deposited into the stream.
+    ///
+    /// For streams created before cumulative tracking was added, the current
+    /// balance plus prior withdrawals is used until the next funding operation
+    /// persists the migrated total.
+    pub fn cumulative_deposited(env: Env) -> Result<i128, Error> {
+        let info = state::try_load(&env)?;
+        cumulative_deposited(&env, &info)
     }
 
     /// Sender designates an operator who can perform sender-level actions
@@ -1793,7 +1873,7 @@ impl DripStream {
         if cliff_unlock_amount < 0 {
             return Err(Error::InvalidAmount);
         }
-        if cliff_time < info.start_time || (info.end_time > 0 && cliff_time >= info.end_time) {
+        if cliff_time < info.start_time || (info.end_time > 0 && cliff_time > info.end_time) {
             return Err(Error::InvalidTimeRange);
         }
 

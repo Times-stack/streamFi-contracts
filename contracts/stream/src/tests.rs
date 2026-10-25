@@ -524,6 +524,23 @@ fn top_up_increases_contract_balance() {
     let stream_before = s.token.balance(&s.client.address);
     s.client.top_up(&s.sender, &50_000);
     assert_eq!(s.token.balance(&s.client.address), stream_before + 50_000);
+    assert_eq!(s.client.cumulative_deposited().unwrap(), 410_000);
+}
+
+#[test]
+fn auto_forward_address_receives_withdrawals_and_can_be_disabled() {
+    let s = Setup::new(100, 3600, false);
+    let forward = Address::generate(&s.env);
+    s.client.set_auto_forward_address(&forward);
+    assert_eq!(s.client.auto_forward_address(), Some(forward.clone()));
+
+    s.advance_secs(50);
+    assert_eq!(s.client.withdraw(&5_000), 5_000);
+    assert_eq!(s.token.balance(&forward), 5_000);
+    assert_eq!(s.token.balance(&s.recipient), 0);
+
+    s.client.set_auto_forward_address(&s.recipient);
+    assert_eq!(s.client.auto_forward_address(), None);
 }
 
 #[test]
@@ -2638,6 +2655,24 @@ fn test_cliff_unlock_percentage_and_linear_streaming() {
     // 100 seconds after cliff: 72,000 + 100 * 100 = 82,000
     s.advance_secs(100);
     assert_eq!(s.client.streamed_total(), 82_000);
+}
+
+#[test]
+fn cliff_at_end_time_unlocks_full_stream_without_arithmetic_panic() {
+    let s = Setup::new(100, 100, false);
+    let end_time = s.client.info().end_time;
+    let full_deposit = 10_000;
+
+    assert!(s
+        .client
+        .try_set_cliff(&s.sender, &end_time, &full_deposit)
+        .is_ok());
+
+    s.advance_secs(100);
+    assert_eq!(s.env.ledger().timestamp(), end_time);
+    assert_eq!(s.client.withdrawable(), full_deposit);
+    assert_eq!(s.client.withdraw(&full_deposit), full_deposit);
+    assert_eq!(s.token.balance(&s.recipient), full_deposit);
 }
 
 #[test]
