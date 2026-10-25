@@ -306,6 +306,13 @@ impl DripGovernor {
         expires_at: Option<u64>,
     ) -> Result<(), Error> {
         role::require_role(&env, &caller, Role::Admin)?;
+        if (role == Role::Admin && expires_at.is_some())
+            || expires_at
+                .map(|timestamp| timestamp <= env.ledger().timestamp())
+                .unwrap_or(false)
+        {
+            return Err(Error::InvalidParam);
+        }
         if role::grant_with_expiration(&env, role, &account, expires_at) {
             events::grant_role(&env, &caller, role, &account);
         }

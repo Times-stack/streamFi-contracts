@@ -135,12 +135,15 @@ where
     AK: StorageKey,
     MK: StorageKey,
 {
-    if has_role(env, role_key) {
-        // Update expiration if already held
+    let storage = env.storage().instance();
+    let was_active = has_role(env, role_key);
+    let assignment_exists = storage.has(role_key);
+    if was_active || assignment_exists {
+        // Renew an expired assignment in place instead of duplicating its member index.
         env.storage()
             .instance()
             .set(role_key, &RoleAssignment { expires_at });
-        return false;
+        return !was_active;
     }
     env.storage()
         .instance()
@@ -239,15 +242,27 @@ where
     AK: StorageKey,
     MK: StorageKey,
 {
-    if !has_role(env, role_key) {
+    let is_active = has_role(env, role_key);
+    let assignment: Option<RoleAssignment> = env.storage().instance().get(role_key);
+    let has_expired_assignment = assignment
+        .as_ref()
+        .and_then(|value| value.expires_at)
+        .map(|expires_at| env.ledger().timestamp() >= expires_at)
+        .unwrap_or(false);
+    if !is_active && !has_expired_assignment {
         return Ok(false);
     }
-    if is_admin {
+    if is_admin && is_active {
         let count = admin_count(env, admin_count_key);
         if count <= 1 {
             return Err(RbacError::LastAdmin);
         }
         env.storage().instance().set(admin_count_key, &(count - 1));
+    } else if is_admin && has_expired_assignment {
+        let count = admin_count(env, admin_count_key);
+        env.storage()
+            .instance()
+            .set(admin_count_key, &count.saturating_sub(1));
     }
     env.storage().instance().remove(role_key);
     // Rebuild the members index without this account.
@@ -507,6 +522,22 @@ mod tests {
             // Fast forward ledger timestamp past expiration
             env.ledger().set_timestamp(expires_at + 1);
             assert!(!has_role(&env, &role_key(TestRole::Operator, &guardian)));
+
+            let renewed_until = expires_at + 100;
+            assert!(grant_with_expiration(
+                &env,
+                &role_key(TestRole::Operator, &guardian),
+                &ADMIN_COUNT,
+                &members_key(&TestRole::Operator),
+                false,
+                &guardian,
+                Some(renewed_until),
+            ));
+            assert!(has_role(&env, &role_key(TestRole::Operator, &guardian)));
+            assert_eq!(
+                role_members(&env, &members_key(&TestRole::Operator)).len(),
+                1
+            );
         });
     }
 

@@ -343,6 +343,10 @@ pub enum Error {
     InvalidHeartbeatTimeout = 1028,
     /// TWAP observation count must be between one and `MAX_TWAP_OBSERVATIONS`.
     InvalidObservationCount = 1029,
+    /// Submitted price deviates more than 50% from the previous accepted price.
+    OracleDeviationTooHigh = 24,
+    /// Temporary expiration cannot be assigned to the Admin role.
+    InvalidRoleExpiration = 1031,
 }
 
 #[contract]
@@ -383,6 +387,32 @@ impl TwapOracle {
     /// hold the role — no event-log replay needed, unlike the old design.
     pub fn role_members(env: Env, role: Role) -> Vec<Address> {
         role_members(&env, role)
+    }
+
+    /// Grants `role` until `expires_at`. Only an Admin may call this.
+    ///
+    /// The Admin role cannot expire, to avoid an expired admin being counted
+    /// as the last administrator after its authorization has ended.
+    pub fn grant_role_with_expiration(
+        env: Env,
+        caller: Address,
+        role: Role,
+        account: Address,
+        expires_at: Option<u64>,
+    ) -> Result<(), Error> {
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        if (role == Role::Admin && expires_at.is_some())
+            || expires_at
+                .map(|timestamp| timestamp <= env.ledger().timestamp())
+                .unwrap_or(false)
+        {
+            return Err(Error::InvalidRoleExpiration);
+        }
+        bump_instance(&env);
+        if grant_role_with_expiration_inner(&env, role, &account, expires_at) {
+            events::grant_role(&env, &caller, role, &account);
+        }
+        Ok(())
     }
 
     /// Returns addresses with tracked price submissions, including stale
@@ -631,6 +661,26 @@ impl TwapOracle {
         // issue #226.
         let now = env.ledger().timestamp();
 
+        let last_price_deviation = env
+            .storage()
+            .instance()
+            .get::<_, PriceData>(&DataKey::Price)
+            .filter(|last| last.price > 0)
+            .map(|last| {
+                (price.abs_diff(last.price) as u128)
+                    .checked_mul(10_000)
+                    .ok_or(Error::ArithmeticOverflow)
+                    .map(|deviation| deviation / last.price as u128)
+            })
+            .transpose()?;
+        if last_price_deviation
+            .map(|deviation| deviation > 5_000)
+            .unwrap_or(false)
+        {
+            events::price_rejected(&env, &caller, price, symbol_short!("deviation"));
+            return Err(Error::OracleDeviationTooHigh);
+        }
+
         if let Some(config) = env
             .storage()
             .instance()
@@ -647,29 +697,13 @@ impl TwapOracle {
                 .instance()
                 .get::<_, u32>(&DataKey::MaxDeviationBps)
                 .unwrap_or(0);
-            if max_deviation > 0 {
-                if let Some(last_price_data) = env
-                    .storage()
-                    .instance()
-                    .get::<_, PriceData>(&DataKey::Price)
-                {
-                    if last_price_data.price > 0 {
-                        let diff = price.abs_diff(last_price_data.price);
-                        let deviation_bps = (diff as u128)
-                            .checked_mul(10_000)
-                            .ok_or(Error::ArithmeticOverflow)?
-                            / (last_price_data.price as u128);
-                        if deviation_bps > max_deviation as u128 {
-                            events::price_rejected(
-                                &env,
-                                &caller,
-                                price,
-                                symbol_short!("deviation"),
-                            );
-                            return Err(Error::ExcessivePriceDeviation);
-                        }
-                    }
-                }
+            if max_deviation > 0
+                && last_price_deviation
+                    .map(|deviation| deviation > max_deviation as u128)
+                    .unwrap_or(false)
+            {
+                events::price_rejected(&env, &caller, price, symbol_short!("deviation"));
+                return Err(Error::ExcessivePriceDeviation);
             }
 
             // Rate-limit: reject a re-submission from this feeder if it arrives
@@ -1766,7 +1800,14 @@ fn has_role(env: &Env, role: Role, account: &Address) -> bool {
 
 /// Returns every account currently holding `role` from the instance-storage index.
 fn role_members(env: &Env, role: Role) -> Vec<Address> {
-    rbac::role_members(env, &DataKey::RoleMembers(role))
+    let all_members = rbac::role_members(env, &DataKey::RoleMembers(role));
+    let mut active_members = Vec::new(env);
+    for account in all_members.iter() {
+        if has_role(env, role, &account) {
+            active_members.push_back(account);
+        }
+    }
+    active_members
 }
 
 fn grant_role_inner(env: &Env, role: Role, account: &Address) -> bool {
@@ -1777,6 +1818,23 @@ fn grant_role_inner(env: &Env, role: Role, account: &Address) -> bool {
         &DataKey::RoleMembers(role),
         role == Role::Admin,
         account,
+    )
+}
+
+fn grant_role_with_expiration_inner(
+    env: &Env,
+    role: Role,
+    account: &Address,
+    expires_at: Option<u64>,
+) -> bool {
+    rbac::grant_with_expiration(
+        env,
+        &role_key(role, account),
+        &DataKey::AdminCount,
+        &DataKey::RoleMembers(role),
+        role == Role::Admin,
+        account,
+        expires_at,
     )
 }
 
@@ -2548,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn get_twap_price_rejects_stale_price() {
+    fn get_twap_price_handles_missing_heartbeat_after_network_partition() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
         grant_admin_feeder(&client, &admin);
@@ -2565,6 +2623,22 @@ mod tests {
 
         client.submit_price(&admin, &50_000_000);
 
+        // A heartbeat exactly at the staleness boundary remains usable.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 60,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        assert_eq!(client.get_twap_price(), 50_000_000);
+
+        // Simulate a partition that delays the next heartbeat beyond the
+        // configured 60-second window. The read returns a stale-feed error
+        // rather than panicking or reusing the old price.
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 61,
             protocol_version: 21,
@@ -2575,7 +2649,6 @@ mod tests {
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6_312_000,
         });
-
         let result = client.try_get_twap_price();
         assert_eq!(result, Err(Ok(Error::OracleStalePrice)));
     }
@@ -2963,6 +3036,41 @@ mod tests {
         client.revoke_role(&admin, &Role::Pauser, &pauser);
         let members = client.role_members(&Role::Pauser);
         assert_eq!(members.len(), 0);
+    }
+
+    #[test]
+    fn expiring_price_feeder_role_is_enforced_and_regrant_keeps_index_unique() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        let expires_at = env.ledger().timestamp() + 100;
+
+        client.grant_role_with_expiration(
+            &admin,
+            &Role::PriceFeeder,
+            &feeder,
+            &Some(expires_at),
+        );
+        assert!(client.has_role(&Role::PriceFeeder, &feeder));
+        assert_eq!(client.role_members(&Role::PriceFeeder).len(), 1);
+
+        env.ledger().set_timestamp(expires_at);
+        assert!(!client.has_role(&Role::PriceFeeder, &feeder));
+        assert!(client.role_members(&Role::PriceFeeder).is_empty());
+        assert_eq!(
+            client.try_submit_price(&feeder, &100),
+            Err(Ok(Error::NotAuthorized))
+        );
+
+        let renewed_until = expires_at + 100;
+        client.grant_role_with_expiration(
+            &admin,
+            &Role::PriceFeeder,
+            &feeder,
+            &Some(renewed_until),
+        );
+        assert!(client.has_role(&Role::PriceFeeder, &feeder));
+        assert_eq!(client.role_members(&Role::PriceFeeder).len(), 1);
     }
 
     #[test]
@@ -4260,6 +4368,39 @@ mod tests {
     }
 
     #[test]
+    fn delayed_heartbeat_returns_stale_status_without_panicking() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        client.configure_oracle(
+            &admin,
+            &OracleConfig {
+                decimals: 8,
+                asset_peg: 1,
+                max_staleness: 300,
+                max_price: 0,
+                min_submit_interval: 0,
+                min_submitters: 1,
+            },
+        );
+        client.submit_price(&feeder, &100_000_000);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 301);
+
+        assert_eq!(
+            client.try_get_twap_price(),
+            Err(Ok(Error::OracleStalePrice))
+        );
+        assert!(client.price_status().stale);
+        assert_eq!(
+            client.try_latest_price(),
+            Err(Ok(Error::StalePriceFeed))
+        );
+    }
+
+    #[test]
     fn test_price_deviation_circuit_breaker() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
@@ -4289,18 +4430,36 @@ mod tests {
         // A sudden drop from 105 to 50 is ~52% deviation (> 10%) -> rejected
         assert_eq!(
             client.try_submit_price(&feeder, &50_000_000),
-            Err(Ok(Error::ExcessivePriceDeviation))
+            Err(Ok(Error::OracleDeviationTooHigh))
         );
 
         // A sudden surge from 105 to 200 is ~90% deviation (> 10%) -> rejected
         assert_eq!(
             client.try_submit_price(&feeder, &200_000_000),
-            Err(Ok(Error::ExcessivePriceDeviation))
+            Err(Ok(Error::OracleDeviationTooHigh))
         );
 
-        // Disabling deviation checks (set to 0) allows any price change
+        // Disabling the configurable limit still preserves the hard 50% cap.
         client.set_max_deviation_bps(&admin, &0);
-        assert!(client.try_submit_price(&feeder, &50_000_000).is_ok());
+        assert!(client.try_submit_price(&feeder, &80_000_000).is_ok());
+    }
+
+    #[test]
+    fn hard_oracle_deviation_limit_rejects_moves_over_fifty_percent() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        client.submit_price(&feeder, &100);
+
+        // The exact 50% boundary is accepted.
+        assert!(client.try_submit_price(&feeder, &50).is_ok());
+        // A move of 52% from the last accepted value is always rejected,
+        // even when the optional configured deviation limit is disabled.
+        assert_eq!(
+            client.try_submit_price(&feeder, &76),
+            Err(Ok(Error::OracleDeviationTooHigh))
+        );
     }
 
     #[test]
