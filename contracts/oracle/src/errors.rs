@@ -48,5 +48,6 @@ pub enum Error {
     PriceDeviationExceeded = 15,
     /// Timestamp exceeds the configured heartbeat interval for the asset.
     OraclePriceStale = 16,
+    /// A submitted price moved more than the hard 50% sanity limit.
+    OracleDeviationTooHigh = 24,
 }
-

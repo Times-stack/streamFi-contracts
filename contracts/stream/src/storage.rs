@@ -84,10 +84,10 @@ pub enum DataKey {
     KeeperRewardPool,
     /// Last ledger on which a keeper reward was paid.
     LastKeeperPingLedger,
-    /// Optional invoice metadata URI set by the sender (Issue #748).
-    InvoiceMetadataUri,
-    /// Optional milestone metadata URI set by the sender (Issue #748).
-    MilestoneMetadataUri,
+    /// Optional address that receives the recipient's stream payouts (#836).
+    AutoForwardAddress,
+    /// Total amount funded into the stream across its lifetime (#837).
+    CumulativeDeposited,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).

@@ -10,11 +10,12 @@
 //! archival. Without TTL extension, idle governors can expire and cause all
 //! downstream `DripFactory::create_stream` calls to fail until restored.
 //!
-//! **Roles:** Four role tiers allow delegation of governance authority:
+//! **Roles:** Five role tiers allow delegation of governance authority:
 //! - `Admin`: grant and revoke any role (super-user).
 //! - `FeeManager`: manage fees via `set_fee_bps` and `set_fee_recipient`.
 //! - `RateManager`: manage rate and duration bounds via `set_max_rate`, `set_min_duration`, `set_max_duration`.
 //! - `Pauser`: emergency pause/unpause via `governor_pause`, `governor_unpause`, `pause_factory`, `unpause_factory`.
+//! - `Executor`: execute proposals after timelock and quorum checks.
 
 mod config;
 mod errors;
@@ -34,7 +35,7 @@ pub use config::GovernorConfig;
 pub use errors::Error;
 pub use role::{Role, RoleMembersPage};
 use storage::DataKey;
-pub use storage::{BalanceCheckpoint, Proposal, ProposalStatus, VoteTallySnapshot};
+pub use storage::{BalanceCheckpoint, Proposal, ProposalStatus, VoteRecord, VoteTallySnapshot};
 
 /// Returns `true` when the governor is under an emergency pause.
 ///
@@ -63,6 +64,24 @@ fn assert_not_paused(env: &Env) -> Result<(), Error> {
     drip_common::pause::require_not_paused(env, &DataKey::Paused).map_err(|_| Error::ContractPaused)
 }
 
+fn refund_proposal_stake(env: &Env, proposal_id: u64, author: &Address) -> Result<(), Error> {
+    let storage = env.storage().instance();
+    let Some(amount) = storage.get::<_, i128>(&DataKey::ProposalStake(proposal_id)) else {
+        return Ok(());
+    };
+    let token: Address = storage
+        .get(&DataKey::ProposalStakeTokenByProposal(proposal_id))
+        .ok_or(Error::ProposalStakeNotConfigured)?;
+    soroban_sdk::token::Client::new(env, &token).transfer(
+        &env.current_contract_address(),
+        author,
+        &amount,
+    );
+    storage.remove(&DataKey::ProposalStake(proposal_id));
+    storage.remove(&DataKey::ProposalStakeTokenByProposal(proposal_id));
+    Ok(())
+}
+
 #[contract]
 pub struct DripGovernor;
 
@@ -75,9 +94,9 @@ impl DripGovernor {
     /// `initialize` again to grant themselves `Admin`, then set `fee_bps` to
     /// the maximum or repoint `fee_recipient`.
     ///
-    /// The deploy `authority` is granted every role, so a single wallet can
-    /// bootstrap the protocol and later delegate fee and rate/duration
-    /// management to separate wallets via [`DripGovernor::grant_role`].
+    /// The deploy `authority` is granted the administration and parameter
+    /// roles. An `Executor` must be explicitly assigned before proposals can
+    /// be executed, keeping execution authority independently delegable.
     pub fn initialize(
         env: Env,
         authority: Address,
@@ -98,6 +117,7 @@ impl DripGovernor {
         s.set(&DataKey::FactoryAddress, &factory_address);
         s.set(&DataKey::ForceCancelPauseSecs, &2_592_000_u64); // 30 days
         s.set(&DataKey::MinQuorumBps, &0_u32);
+        s.set(&DataKey::MinProposalStake, &0_i128);
 
         role::grant(&env, Role::Admin, &authority);
         role::grant(&env, Role::FeeManager, &authority);
@@ -286,6 +306,13 @@ impl DripGovernor {
         expires_at: Option<u64>,
     ) -> Result<(), Error> {
         role::require_role(&env, &caller, Role::Admin)?;
+        if (role == Role::Admin && expires_at.is_some())
+            || expires_at
+                .map(|timestamp| timestamp <= env.ledger().timestamp())
+                .unwrap_or(false)
+        {
+            return Err(Error::InvalidParam);
+        }
         if role::grant_with_expiration(&env, role, &account, expires_at) {
             events::grant_role(&env, &caller, role, &account);
         }
@@ -410,6 +437,9 @@ impl DripGovernor {
             return Err(Error::InvalidParam);
         }
         role::require_role(&env, &caller, Role::Admin)?;
+        if env.storage().instance().has(&DataKey::PendingAuthority) {
+            return Err(Error::AdminTransferAlreadyInProgress);
+        }
         env.storage()
             .instance()
             .set(&DataKey::PendingAuthority, &new_authority);
@@ -730,6 +760,23 @@ impl DripGovernor {
             })
     }
 
+    /// Configures the token and minimum refundable stake required to create proposals.
+    ///
+    /// Only an `Admin` may call this. Existing proposal stakes retain the token
+    /// and amount used when each proposal was created.
+    pub fn set_proposal_stake_config(
+        env: Env,
+        caller: Address,
+        token: Address,
+        min_stake: i128,
+    ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
+        role::require_role(&env, &caller, Role::Admin)?;
+        config::set_proposal_stake_config(&env, &token, min_stake)?;
+        events::set_proposal_stake_config(&env, &caller, &token, min_stake);
+        Ok(())
+    }
+
     // ── Proposals (Admin-gated) ──────────────────────────────────────────────
 
     /// Record a token balance / voting weight checkpoint for `voter` at the current ledger.
@@ -767,6 +814,11 @@ impl DripGovernor {
         storage::get_vote_tally_snapshot(&env, proposal_id).ok_or(Error::ProposalNotFound)
     }
 
+    /// Read-only: returns the immutable vote distribution archived after a proposal ends.
+    pub fn get_vote_record(env: Env, proposal_id: u64) -> Result<VoteRecord, Error> {
+        storage::get_vote_record(&env, proposal_id).ok_or(Error::ProposalNotFound)
+    }
+
     /// Create a new governance proposal.
     ///
     /// Only an `Admin` may create proposals. The proposal has an execution
@@ -777,6 +829,17 @@ impl DripGovernor {
         if execution_window_secs == 0 {
             return Err(Error::InvalidParam);
         }
+        let stake_config = config::load(&env)?;
+        let token = stake_config
+            .proposal_stake_token
+            .as_ref()
+            .filter(|_| stake_config.min_proposal_stake > 0)
+            .ok_or(Error::ProposalStakeNotConfigured)?;
+        soroban_sdk::token::Client::new(&env, token).transfer(
+            &caller,
+            &env.current_contract_address(),
+            &stake_config.min_proposal_stake,
+        );
         ttl::bump(&env);
 
         let counter: u64 = env
@@ -811,7 +874,18 @@ impl DripGovernor {
             .set(&DataKey::Proposal(proposal_id), &proposal);
         env.storage()
             .instance()
+            .set(&DataKey::ProposalAbstainVotes(proposal_id), &0_u64);
+        env.storage()
+            .instance()
             .set(&DataKey::ProposalCounter, &proposal_id);
+        env.storage().instance().set(
+            &DataKey::ProposalStake(proposal_id),
+            &stake_config.min_proposal_stake,
+        );
+        env.storage().instance().set(
+            &DataKey::ProposalStakeTokenByProposal(proposal_id),
+            token,
+        );
         storage::add_proposal_to_status_index(&env, proposal_id, storage::ProposalStatus::Pending);
         storage::set_proposal_snapshot_ledger(&env, proposal_id, snapshot_ledger);
         storage::save_vote_tally_snapshot(&env, &snapshot);
@@ -854,7 +928,12 @@ impl DripGovernor {
     /// Fails with `ProposalExpired` if the execution window has elapsed.
     /// Fails with `ProposalNotPending` if the proposal has been executed or cancelled.
     /// Fails with `QuorumNotMet` if total votes (for_votes + against_votes) do not reach minimum quorum.
-    pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
+    pub fn execute_proposal(
+        env: Env,
+        executor: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        role::require_executor(&env, &executor)?;
         ttl::bump(&env);
 
         let proposal: storage::Proposal = env
@@ -887,12 +966,16 @@ impl DripGovernor {
                 .map(|s| s.total_supply)
                 .unwrap_or_else(|| Self::governance_supply(env.clone()));
             let quorum_threshold = (total_supply as u128 * min_quorum_bps as u128 / 10_000) as u64;
-            let total_votes = proposal.for_votes.saturating_add(proposal.against_votes);
+            let total_votes = proposal
+                .for_votes
+                .saturating_add(proposal.against_votes)
+                .saturating_add(storage::get_abstain_votes(&env, proposal_id));
             if total_votes < quorum_threshold {
                 return Err(Error::QuorumNotMet);
             }
         }
 
+        refund_proposal_stake(&env, proposal_id, &proposal.author)?;
         storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Executed);
 
         Ok(())
@@ -922,8 +1005,36 @@ impl DripGovernor {
             return Err(Error::ProposalNotPending);
         }
 
+        storage::archive_vote_record(&env, proposal_id, &proposal);
         storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Cancelled);
 
+        Ok(())
+    }
+
+    /// Cancel a pending or active proposal in an emergency. Only an Admin may call this.
+    pub fn cancel_proposal_by_admin(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        role::require_role(&env, &caller, Role::Admin)?;
+        ttl::bump(&env);
+
+        let proposal: storage::Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        if proposal.status != storage::ProposalStatus::Pending
+            && proposal.status != storage::ProposalStatus::Active
+        {
+            return Err(Error::ProposalNotPending);
+        }
+
+        storage::archive_vote_record(&env, proposal_id, &proposal);
+        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Cancelled);
+        events::proposal_cancelled_by_admin(&env, &caller, proposal_id, &reason_hash);
         Ok(())
     }
 
@@ -945,62 +1056,15 @@ impl DripGovernor {
         support: bool,
         rationale: Option<String>,
     ) -> Result<(), Error> {
-        voter.require_auth();
-        ttl::bump(&env);
+        cast_ballot(env, voter, proposal_id, Some(support), rationale)
+    }
 
-        if storage::has_voted(&env, proposal_id, &voter) {
-            return Err(Error::AlreadyVoted);
+        let min_quorum_bps = config::load(&env)?.min_quorum_bps;
+        let quorum_threshold =
+            (snapshot.total_supply as u128 * min_quorum_bps as u128 / 10_000) as u64;
+        if proposal.for_votes.saturating_add(proposal.against_votes) >= quorum_threshold {
+            refund_proposal_stake(&env, proposal_id, &proposal.author)?;
         }
-
-        let mut proposal: storage::Proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(Error::ProposalNotFound)?;
-
-        if proposal.status != storage::ProposalStatus::Pending
-            && proposal.status != storage::ProposalStatus::Active
-        {
-            return Err(Error::ProposalNotPending);
-        }
-
-        let elapsed = env.ledger().timestamp().saturating_sub(proposal.created_at);
-        if elapsed
-            > proposal
-                .execution_window_secs
-                .saturating_add(Self::MIN_EXECUTION_DELAY)
-        {
-            return Err(Error::ProposalExpired);
-        }
-
-        let weight = match storage::get_checkpoint_weight(&env, &voter, proposal.snapshot_ledger) {
-            Some(0) => return Err(Error::InsufficientVotingWeight),
-            Some(w) => w,
-            None => 1,
-        };
-
-        if support {
-            proposal.for_votes = proposal.for_votes.saturating_add(weight);
-        } else {
-            proposal.against_votes = proposal.against_votes.saturating_add(weight);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-        storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Active);
-
-        let snapshot = storage::VoteTallySnapshot {
-            proposal_id,
-            snapshot_ledger: proposal.snapshot_ledger,
-            for_votes: proposal.for_votes,
-            against_votes: proposal.against_votes,
-            total_supply: storage::get_vote_tally_snapshot(&env, proposal_id)
-                .map(|s| s.total_supply)
-                .unwrap_or_else(|| Self::governance_supply(env.clone())),
-        };
-        storage::save_vote_tally_snapshot(&env, &snapshot);
-        storage::record_voter_receipt(&env, proposal_id, &voter, weight);
 
         events::vote_cast(&env, &voter, proposal_id, support, rationale);
         Ok(())

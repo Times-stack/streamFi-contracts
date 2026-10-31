@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, IntoVal,
+    token, Address, Env, IntoVal,
 };
 
 fn create_test_env() -> (Env, Address, Address, Address) {
@@ -16,6 +16,20 @@ fn create_test_env() -> (Env, Address, Address, Address) {
     let factory_address = Address::generate(&env);
 
     (env, authority, fee_recipient, factory_address)
+}
+
+fn configure_proposal_stake(
+    env: &Env,
+    client: &DripGovernorClient<'_>,
+    authority: &Address,
+) {
+    client.grant_role(authority, &Role::Executor, authority);
+    let token_admin = Address::generate(env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(env, &token_address).mint(authority, &100);
+    client.set_proposal_stake_config(authority, &token_address, &1);
 }
 
 #[test]
@@ -130,6 +144,7 @@ fn test_cast_vote_with_rationale_emits_detailed_event() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     // Create a proposal
     let proposal_id = client.propose(&authority, &3600);
@@ -154,11 +169,12 @@ fn test_execute_proposal_enforces_timelock_delay() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     let proposal_id = client.propose(&authority, &3600);
 
     // Try executing immediately — should fail with TimelockNotMet
-    let res = client.try_execute_proposal(&proposal_id);
+    let res = client.try_execute_proposal(&authority, &proposal_id);
     assert_eq!(res, Err(Ok(Error::TimelockNotMet)));
 
     // Advance ledger timestamp to satisfy timelock delay (604_800s)
@@ -166,7 +182,7 @@ fn test_execute_proposal_enforces_timelock_delay() {
     env.ledger().set_timestamp(current_time + 604_800);
 
     // Now execute succeeds
-    assert!(client.try_execute_proposal(&proposal_id).is_ok());
+    assert!(client.try_execute_proposal(&authority, &proposal_id).is_ok());
 }
 
 #[test]
@@ -206,6 +222,7 @@ fn test_execute_proposal_enforces_quorum_threshold() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     // Set governance supply to 10 and min_quorum_bps to 2000 (20% -> 2 votes needed)
     client.set_governance_supply(&authority, &10);
@@ -218,13 +235,13 @@ fn test_execute_proposal_enforces_quorum_threshold() {
     env.ledger().set_timestamp(current_time + 604_800);
 
     // 0 votes cast -> fails with QuorumNotMet
-    let res = client.try_execute_proposal(&proposal_id);
+    let res = client.try_execute_proposal(&authority, &proposal_id);
     assert_eq!(res, Err(Ok(Error::QuorumNotMet)));
 
     // Cast 1 vote -> total_votes = 1 < 2 -> fails with QuorumNotMet
     let voter1 = Address::generate(&env);
     assert!(client.try_cast_vote(&voter1, &proposal_id, &true).is_ok());
-    let res2 = client.try_execute_proposal(&proposal_id);
+    let res2 = client.try_execute_proposal(&authority, &proposal_id);
     assert_eq!(res2, Err(Ok(Error::QuorumNotMet)));
 
     // Cast 2nd vote (against) -> total_votes = 2 >= 2 -> quorum met!
@@ -236,7 +253,7 @@ fn test_execute_proposal_enforces_quorum_threshold() {
     assert_eq!(proposal.against_votes, 1);
 
     // Now execute succeeds!
-    assert!(client.try_execute_proposal(&proposal_id).is_ok());
+    assert!(client.try_execute_proposal(&authority, &proposal_id).is_ok());
 }
 
 #[test]
@@ -285,6 +302,7 @@ fn test_proposal_vote_tally_snapshotting_prevents_double_vote_transfer() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     let voter_a = Address::generate(&env);
     let wallet_b = Address::generate(&env);
@@ -324,12 +342,88 @@ fn test_proposal_vote_tally_snapshotting_prevents_double_vote_transfer() {
 }
 
 #[test]
+fn test_admin_cancellation_archives_votes_and_emits_reason_hash() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+    let proposal_id = client.propose(&authority, &3600);
+    let for_voter = Address::generate(&env);
+    let abstain_voter = Address::generate(&env);
+    client.cast_vote(&for_voter, &proposal_id, &true);
+    client.cast_abstain_vote(&abstain_voter, &proposal_id);
+
+    let reason_hash = BytesN::from_array(&env, &[7; 32]);
+    client.cancel_proposal_by_admin(&authority, &proposal_id, &reason_hash);
+
+    let record = client.get_vote_record(&proposal_id);
+    assert_eq!(record.for_votes, 1);
+    assert_eq!(record.against_votes, 0);
+    assert_eq!(record.abstain_votes, 1);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(
+        topics,
+        (
+            Symbol::new(&env, "ProposalCancelledByAdmin"),
+            proposal_id,
+            authority,
+        )
+            .into_val(&env)
+    );
+    assert_eq!(data, reason_hash.into_val(&env));
+}
+
+#[test]
+fn test_decaying_checkpoint_weights_are_used_at_proposal_snapshots() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+    let voter = Address::generate(&env);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+
+    // Checkpoint weights represent voting power as progressively shorter
+    // lock-ups decay; each proposal must use the weight at its own snapshot.
+    env.ledger().set_sequence_number(10);
+    client.checkpoint_balance(&authority, &voter, &300);
+    env.ledger().set_sequence_number(15);
+    let long_lock_proposal = client.propose(&authority, &3600);
+    client.cast_vote(&voter, &long_lock_proposal, &true);
+    assert_eq!(client.get_proposal(&long_lock_proposal).for_votes, 300);
+
+    env.ledger().set_sequence_number(20);
+    client.checkpoint_balance(&authority, &voter, &200);
+    env.ledger().set_sequence_number(25);
+    let medium_lock_proposal = client.propose(&authority, &3600);
+    client.cast_vote(&voter, &medium_lock_proposal, &false);
+    assert_eq!(
+        client.get_proposal(&medium_lock_proposal).against_votes,
+        200
+    );
+
+    env.ledger().set_sequence_number(30);
+    client.checkpoint_balance(&authority, &voter, &100);
+    env.ledger().set_sequence_number(35);
+    let short_lock_proposal = client.propose(&authority, &3600);
+    client.cast_abstain_vote(&voter, &short_lock_proposal);
+    let reason_hash = BytesN::from_array(&env, &[1; 32]);
+    client.cancel_proposal_by_admin(&authority, &short_lock_proposal, &reason_hash);
+    assert_eq!(
+        client.get_vote_record(&short_lock_proposal).abstain_votes,
+        100
+    );
+}
+
+#[test]
 fn test_quorum_calculation_with_fractional_tokens() {
     let (env, authority, fee_recipient, factory_address) = create_test_env();
     let contract_id = env.register_contract(None, DripGovernor);
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     // Set governance supply to odd number (11) and min_quorum_bps to 4545 (≈45%)
     // 11 * 4545 / 10000 = 4.9995, which truncates to 4 votes required
@@ -350,14 +444,14 @@ fn test_quorum_calculation_with_fractional_tokens() {
     assert!(client.try_cast_vote(&voter2, &proposal_id, &true).is_ok());
     assert!(client.try_cast_vote(&voter3, &proposal_id, &true).is_ok());
     assert_eq!(
-        client.try_execute_proposal(&proposal_id),
+        client.try_execute_proposal(&authority, &proposal_id),
         Err(Ok(Error::QuorumNotMet))
     );
 
     // 4th vote -> total = 4 >= 4 -> quorum met!
     let voter4 = Address::generate(&env);
     assert!(client.try_cast_vote(&voter4, &proposal_id, &true).is_ok());
-    assert!(client.try_execute_proposal(&proposal_id).is_ok());
+    assert!(client.try_execute_proposal(&authority, &proposal_id).is_ok());
 }
 
 #[test]
@@ -367,6 +461,7 @@ fn test_quorum_calculation_with_100_percent_threshold() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     // Set governance supply to 7 and min_quorum_bps to 10000 (100%)
     client.set_governance_supply(&authority, &7);
@@ -384,14 +479,14 @@ fn test_quorum_calculation_with_100_percent_threshold() {
         assert!(client.try_cast_vote(&voter, &proposal_id, &true).is_ok());
     }
     assert_eq!(
-        client.try_execute_proposal(&proposal_id),
+        client.try_execute_proposal(&authority, &proposal_id),
         Err(Ok(Error::QuorumNotMet))
     );
 
     // 7th vote -> quorum met!
     let voter7 = Address::generate(&env);
     assert!(client.try_cast_vote(&voter7, &proposal_id, &true).is_ok());
-    assert!(client.try_execute_proposal(&proposal_id).is_ok());
+    assert!(client.try_execute_proposal(&authority, &proposal_id).is_ok());
 }
 
 #[test]
@@ -401,6 +496,7 @@ fn test_quorum_calculation_with_small_supply_and_low_threshold() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     // Set governance supply to 3 and min_quorum_bps to 3334 (≈33.34%)
     // 3 * 3334 / 10000 = 1.0002, which truncates to 1 vote required
@@ -416,7 +512,7 @@ fn test_quorum_calculation_with_small_supply_and_low_threshold() {
     // Single vote meets quorum (1 >= 1)
     let voter1 = Address::generate(&env);
     assert!(client.try_cast_vote(&voter1, &proposal_id, &true).is_ok());
-    assert!(client.try_execute_proposal(&proposal_id).is_ok());
+    assert!(client.try_execute_proposal(&authority, &proposal_id).is_ok());
 }
 
 #[test]
@@ -426,6 +522,7 @@ fn proposals_are_indexed_by_status_transitions() {
     let client = DripGovernorClient::new(&env, &contract_id);
 
     client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
 
     let first = client.propose(&authority, &3600);
     let second = client.propose(&authority, &3600);
@@ -451,7 +548,7 @@ fn proposals_are_indexed_by_status_transitions() {
 
     env.ledger()
         .set_timestamp(env.ledger().timestamp() + 604_800);
-    assert!(client.try_execute_proposal(&second).is_ok());
+    assert!(client.try_execute_proposal(&authority, &second).is_ok());
     assert_eq!(
         client.proposals_by_status(&ProposalStatus::Executed),
         soroban_sdk::vec![&env, second]
@@ -466,6 +563,7 @@ fn proposals_are_indexed_by_status_transitions() {
         client.proposals_by_status(&ProposalStatus::Cancelled),
         soroban_sdk::vec![&env, third]
     );
+    assert_eq!(client.get_vote_record(&third).for_votes, 0);
     assert!(client
         .proposals_by_status(&ProposalStatus::Pending)
         .is_empty());
